@@ -33,8 +33,8 @@ def _config() -> PlatformConfig:
 def _register() -> None:
     platform_registry.register(
         PlatformEntry(
-            name="meshtastic-gateway",
-            label="Meshtastic",
+            name="radio-dm-gateway",
+            label="Radio DM",
             adapter_factory=lambda cfg: adapter.MeshtasticAdapter(cfg),
             check_fn=lambda: True,
             validate_config=adapter.validate_config,
@@ -55,7 +55,7 @@ class _Iface:
 
 def test_create_adapter_then_handle_message_sends_pong():
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     assert created is not None
     assert type(created) is adapter.MeshtasticAdapter
 
@@ -134,7 +134,7 @@ def test_open_interface_runs_off_the_event_loop(monkeypatch):
     monkeypatch.setattr(adapter, "local_node", lambda _iface: "!11223344")
     monkeypatch.setattr(adapter, "close_interface", lambda _iface: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
 
     async def run():
         assert await created.connect() is True
@@ -146,7 +146,7 @@ def test_open_interface_runs_off_the_event_loop(monkeypatch):
 def test_stopped_loop_does_not_consume_the_packet_id(monkeypatch):
     monkeypatch.setattr(adapter, "local_node", lambda _iface: "!11223344")
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     created._iface = object()
     created._loop = None
     created._on_packet({
@@ -163,7 +163,7 @@ def test_failed_handoff_forgets_the_packet_id(monkeypatch):
     recorded = []
     monkeypatch.setattr(adapter, "remember", lambda *args: recorded.append(args))
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     created._seen = ["7"]
 
     def broken_source(**_kwargs):
@@ -183,7 +183,7 @@ def test_handle_message_without_radio_does_not_record(monkeypatch):
     recorded = []
     monkeypatch.setattr(adapter, "remember", lambda *args: recorded.append(args))
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     source = created.build_source(
         chat_id="!aabbccdd",
         chat_type="dm",
@@ -206,7 +206,7 @@ def test_handle_message_without_radio_does_not_record(monkeypatch):
 
 def test_connection_lost_stops_the_adapter_and_asks_hermes_to_reconnect():
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     notes = []
 
     async def notify():
@@ -229,7 +229,7 @@ def test_decimal_and_uppercase_allowlist_entries_are_canonical():
     _register()
     cfg = _config()
     cfg.extra["MESHTASTIC_ALLOWED_NODES"] = "2864434397, !AABBCCDD"
-    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    created = platform_registry.create_adapter("radio-dm-gateway", cfg)
     assert created.resolved_allowlist_user_ids() == {"!aabbccdd"}
 
 
@@ -245,7 +245,7 @@ def test_a_chunk_already_on_the_radio_is_final(monkeypatch):
     monkeypatch.setattr(adapter, "send_text", send_text)
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     created._iface = object()
     created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "64"
     created.config.extra["MESHTASTIC_MAX_CHUNKS"] = "4"
@@ -268,9 +268,49 @@ def test_a_chunk_already_on_the_radio_is_final(monkeypatch):
 
     result = asyncio.run(run())
     assert result.success is False
-    assert result.raw_response == {"chunks_sent": 1}
+    assert result.raw_response == {"chunks_sent": 1, "may_have_reached": True}
     assert created._send_retry_is_final(result) is True
     assert "not sent again" in (result.error or "")
+    assert "may have reached the radio" in (result.error or "")
+
+
+def test_a_first_chunk_link_drop_is_final_and_names_no_retry_class(monkeypatch):
+    def send_text(*_args):
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(adapter, "send_text", send_text)
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    created._iface = object()
+
+    async def run():
+        token = adapter._reply_node.set("!aabbccdd")
+        created._send_tasks.add(asyncio.current_task())
+        try:
+            return await created.send("!aabbccdd", "hello")
+        finally:
+            created._send_tasks.discard(asyncio.current_task())
+            adapter._reply_node.reset(token)
+
+    result = asyncio.run(run())
+    low = (result.error or "").lower()
+    assert result.success is False
+    assert result.raw_response == {"chunks_sent": 0, "may_have_reached": True}
+    assert created._send_retry_is_final(result) is True
+    assert "may have reached the radio" in low
+    assert "not sent again" in low
+    for mark in (
+        "connectionreset",
+        "connectionerror",
+        "connectionrefused",
+        "connecterror",
+        "connecttimeout",
+        "broken pipe",
+        "remotedisconnected",
+        "eoferror",
+    ):
+        assert mark not in low
 
 
 def test_a_reply_that_never_reaches_the_radio_can_be_accepted_again(monkeypatch):
@@ -280,7 +320,7 @@ def test_a_reply_that_never_reaches_the_radio_can_be_accepted_again(monkeypatch)
     monkeypatch.setattr(adapter, "send_text", send_text)
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     created._iface = object()
     created._seen = ["9"]
 
@@ -321,7 +361,7 @@ def test_two_nodes_talking_at_once_both_get_their_approval_question(monkeypatch)
     _register()
     cfg = _config()
     cfg.extra["MESHTASTIC_ALLOWED_NODES"] = "!aabbccdd,!11223344"
-    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    created = platform_registry.create_adapter("radio-dm-gateway", cfg)
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -364,7 +404,7 @@ def test_two_nodes_talking_at_once_both_get_their_approval_question(monkeypatch)
 def test_a_task_made_in_the_turn_cannot_send_after_the_turn(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -398,7 +438,7 @@ def test_a_task_made_in_the_turn_cannot_send_after_the_turn(monkeypatch):
 def test_radio_cannot_approve_for_the_session_or_always(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -429,7 +469,7 @@ def test_radio_cannot_approve_for_the_session_or_always(monkeypatch):
 def test_a_chunk_size_below_the_floor_is_read_as_64(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -458,7 +498,7 @@ def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypat
     _register()
     cfg = _config()
     cfg.extra["MESHTASTIC_MIN_GAP_SECONDS"] = "20"
-    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    created = platform_registry.create_adapter("radio-dm-gateway", cfg)
     iface = _Iface()
     created._iface = iface
     box = {}
@@ -503,7 +543,7 @@ def test_each_node_forgets_only_its_own_packet(monkeypatch):
     _register()
     cfg = _config()
     cfg.extra["MESHTASTIC_ALLOWED_NODES"] = "!aabbccdd,!11223344"
-    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    created = platform_registry.create_adapter("radio-dm-gateway", cfg)
     created._budget = _NoWaitBudget()
 
     class _HalfIface(_Iface):
@@ -539,7 +579,7 @@ def test_each_node_forgets_only_its_own_packet(monkeypatch):
 def test_radio_commands_outside_the_list_never_reach_hermes(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -574,7 +614,7 @@ def test_hermes_text_approval_question_goes_out_only_when_it_fits_one_chunk(monk
     assert len(question.encode("utf-8")) > 200
     long_question = _format_exec_approval_fallback("echo " + "x" * 300, "long command", "/")
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -609,7 +649,7 @@ def test_plain_text_restart_never_reaches_hermes(monkeypatch, own_regex):
         # Only Hermes' own rewrite is left to catch the phrase.
         monkeypatch.setattr(adapter, "plaintext_restart", lambda _text: False)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()
@@ -645,7 +685,7 @@ async def _send_in_turn(created, text, **kwargs):
 def test_a_send_after_the_radio_is_lost_fails_at_once(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
 
     class _SlowIface(_Iface):
         def sendText(self, text, destinationId, wantAck=False):
@@ -680,7 +720,7 @@ def test_a_send_after_the_radio_is_lost_fails_at_once(monkeypatch):
 def test_a_send_while_the_link_is_down_fails_at_once(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     iface.isConnected = threading.Event()  # the library clears it while the link is down
     created._iface = iface
@@ -702,7 +742,7 @@ def test_a_send_while_the_link_is_down_fails_at_once(monkeypatch):
 def test_a_slow_radio_send_does_not_block_the_event_loop(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
 
     class _SlowIface(_Iface):
         def sendText(self, text, destinationId, wantAck=False):
@@ -737,7 +777,7 @@ def test_an_approval_question_does_not_wait_past_its_limit_for_another_send(monk
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.3)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
 
     class _SlowIface(_Iface):
         def sendText(self, text, destinationId, wantAck=False):
@@ -778,7 +818,7 @@ def test_hermes_closes_an_approval_whose_question_did_not_fit(monkeypatch, tmp_p
 
     monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 1)
     _register()
-    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
     iface = _Iface()
     created._iface = iface
     created._budget = _NoWaitBudget()

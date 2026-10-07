@@ -17,7 +17,7 @@ def data_dir() -> Path | None:
     except Exception:
         return None
     try:
-        path = Path(plugin_data_dir("meshtastic-gateway"))
+        path = Path(plugin_data_dir("radio-dm-gateway"))
     except Exception:
         return None
     return path

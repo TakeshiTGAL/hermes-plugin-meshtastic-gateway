@@ -73,7 +73,7 @@ else:
 
 _reply_node: contextvars.ContextVar[str] = contextvars.ContextVar("meshtastic_reply_node", default="")
 _from_radio: contextvars.ContextVar[bool] = contextvars.ContextVar("meshtastic_from_radio", default=False)
-PLATFORM = "meshtastic-gateway"
+PLATFORM = "radio-dm-gateway"
 # Hermes waits 15 seconds for an approval question to be sent. This send must end before that.
 APPROVAL_SEND_SECONDS = 12
 APPROVAL_SCOPE_REFUSAL = (
@@ -165,9 +165,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return set(self._allowlist())
 
     def _send_retry_is_final(self, result: SendResult) -> bool:
-        """A chunk already on the radio must not be sent again. Hermes retries when the error names ConnectionError, and otherwise sends the whole reply as plain text."""
+        """Stop Hermes from sending this reply again inside the turn.
+
+        A chunk already counted as sent is final. A library error during sendText is also final:
+        the class name would otherwise match Hermes's retry list (ConnectionResetError and the rest)
+        or fall through to a plain-text resend of the whole reply. Either path can put the text on
+        the radio twice. The 30-second and 2-minute ledger retries are a different path; this adapter
+        refuses those because they are outside the turn.
+        """
         raw = getattr(result, "raw_response", None)
-        sent = raw.get("chunks_sent") if isinstance(raw, dict) else None
+        if not isinstance(raw, dict):
+            return False
+        if raw.get("may_have_reached") is True:
+            return True
+        sent = raw.get("chunks_sent")
         return isinstance(sent, int) and not isinstance(sent, bool) and sent > 0
 
     def _budget_for(self) -> SendBudget:
@@ -500,16 +511,19 @@ class MeshtasticAdapter(BasePlatformAdapter):
             try:
                 # Off the event loop: the library can block while the link is down.
                 packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
-            except Exception as exc:
+            except Exception:
+                # The class name is omitted on purpose. Hermes retries when the error text contains
+                # connectionreset, connectionerror, and the other names in _RETRYABLE_ERROR_PATTERNS,
+                # and otherwise sends the whole reply again as plain text.
                 return self._forget_failed_reply(SendResult(
                     success=False,
                     error=(
-                        f"Sent {len(sent)} of {len(chunks)}. The radio stopped the rest: {exc.__class__.__name__}. "
-                        "Check the radio link. The part already sent is not sent again."
+                        f"Sent {len(sent)} of {len(chunks)}. The library did not finish this chunk, "
+                        "so this attempt may have reached the radio. It is not sent again."
                     ),
                     message_id=sent[-1] if sent else None,
                     retryable=False,
-                    raw_response={"chunks_sent": len(sent)},
+                    raw_response={"chunks_sent": len(sent), "may_have_reached": True},
                 ))
             budget.mark(time.time())
             sent.append(packet_id)
@@ -541,7 +555,7 @@ def validate_config(config: PlatformConfig) -> bool:
 def register(ctx) -> None:
     ctx.register_platform(
         name=PLATFORM,
-        label="Meshtastic",
+        label="Radio DM",
         adapter_factory=lambda cfg: MeshtasticAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
