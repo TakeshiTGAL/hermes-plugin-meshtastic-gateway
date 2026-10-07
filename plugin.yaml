@@ -1,0 +1,45 @@
+name: meshtastic-gateway
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.4"
+kind: platform
+description: >-
+  Talk to Hermes over a Meshtastic radio, built on the Meshtastic Python
+  API. An allowlisted direct message is answered only when pkiEncrypted
+  is true. An empty allowlist answers nobody. Channel packets are never
+  answered, because a channel key can impersonate a sender. Unsolicited
+  sends are refused. Cron does not transmit. TCP only.
+author: TakeshiTGAL
+license: GPL-3.0-only
+homepage: https://github.com/TakeshiTGAL/hermes-plugin-meshtastic-gateway
+tags: [meshtastic, lora, gateway]
+requires_env:
+  - name: MESHTASTIC_URL
+    description: "One radio. tcp://radio.example:4403. serial:// and ble:// are refused. No userinfo, path, or query on tcp."
+    prompt: "Meshtastic URL"
+    secret: false
+    password: false
+optional_env:
+  - name: MESHTASTIC_ALLOWED_NODES
+    description: "Comma-separated node ids (!aabbccdd or decimal). Empty answers nobody. An unreadable id refuses the connection. There is no allow-all switch."
+    prompt: "Allowed node ids (or empty)"
+    secret: false
+    password: false
+  - name: MESHTASTIC_CHUNK_BYTES
+    description: "UTF-8 bytes per radio text. Default 200. Clamped to 1-200. Tool arguments cannot raise it."
+    prompt: "Bytes per chunk"
+    password: false
+  - name: MESHTASTIC_MAX_CHUNKS
+    description: "How many texts one reply may use. Default 4. Clamped to 1-8."
+    prompt: "Max chunks"
+    password: false
+  - name: MESHTASTIC_MIN_GAP_SECONDS
+    description: "Minimum seconds between radio sends. Default 20. Clamped to 10-3600."
+    prompt: "Seconds between sends"
+    password: false
+  - name: MESHTASTIC_MAX_PER_HOUR
+    description: "Maximum radio sends in a rolling hour on this adapter. Default 12. Cannot be set above 30. A new adapter, including a Hermes reconnect, starts the hour over and forgets packet ids already seen, so a retransmission can be answered again. The same adapter keeps only the last 100 packet ids, so an older retransmission can be answered again."
+    prompt: "Sends per hour"
+    password: false
+config_schema: {}
+provides_tools: []
