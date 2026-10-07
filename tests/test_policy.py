@@ -162,3 +162,50 @@ def test_serial_and_ble_are_refused_before_the_library():
             assert "Nothing is connected" in str(exc)
         else:
             raise AssertionError(spec)
+
+
+def test_session_and_always_approvals_are_recognized():
+    for text in (
+        "/approve always", "/approve all always", "/APPROVE  session", "/approve permanent",
+        "/approve ses", "/always", "/remember", "!remember", "always", "Session",
+        "approve always", "always approve", "session approve", "@file:x\n/approve always",
+    ):
+        assert policy.widens_approval(text) is True, text
+    for text in ("/approve", "/approve all", "/deny", "yes", "always reply in English", ""):
+        assert policy.widens_approval(text) is False, text
+    assert policy.widens_approval("zawsze", ("Zawsze",)) is True
+
+
+def test_tcp_port_zero_or_out_of_range_is_refused():
+    for url in ("tcp://radio.example:0", "tcp://radio.example:65536", "tcp://radio.example:99999"):
+        try:
+            parse_url(url)
+        except ValueError as exc:
+            assert "1 to 65535" in str(exc)
+        else:
+            raise AssertionError(f"{url} was accepted")
+    assert parse_url("tcp://radio.example:1")["port"] == 1
+    assert parse_url("tcp://radio.example:65535")["port"] == 65535
+
+
+def test_radio_commands_are_an_allowlist():
+    for text in ("/yolo", "/approvals off", "/APPROVALS OFF", "!yolo", "/yolo@bot", "/restart", "/model x"):
+        assert policy.radio_command_refusal(text) == "command", text
+    for text in ("/approve always", "/approve session", "/approve all"):
+        assert policy.radio_command_refusal(text) == "approve", text
+    for text in ("/approve", "/approve once", "/deny", "/stop", "/new", "/reset", "/help", "/STATUS@bot",
+                 "/whoami", "/retry", "/undo", "hello", "/home/me/file is broken", ""):
+        assert policy.radio_command_refusal(text) is None, text
+
+
+def test_approval_question_is_made_short():
+    question = "Heading\n```\nls -la\n```\nWhy it was flagged: test\n\nReply `/approve` ..."
+    assert policy.radio_approval_text(question) == "Reply /approve or /deny (once only). Run: ls -la — test"
+    assert policy.radio_approval_text("Approve?") == "Reply /approve or /deny (once only). Approve?"
+
+
+def test_plain_text_restart_phrases_are_read_as_restart():
+    for text in ("restart gateway", "please restart hermes", "Restart the Hermes gateway!"):
+        assert policy.plaintext_restart(text) is True, text
+    for text in ("restart the router", "can you restart gateway later", "/restart", ""):
+        assert policy.plaintext_restart(text) is False, text

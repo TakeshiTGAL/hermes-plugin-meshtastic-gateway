@@ -12,6 +12,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 if __package__:
     from .policy import (
+        CUT_MARK,
         SendBudget,
         allowlist_problem,
         chunk_bytes,
@@ -24,6 +25,10 @@ if __package__:
         node_id,
         parse_allowlist,
         parse_url,
+        plaintext_restart,
+        radio_approval_text,
+        radio_command_refusal,
+        widens_approval,
     )
     from .radio import (
         close_interface,
@@ -37,6 +42,7 @@ if __package__:
     from .store import remember
 else:
     from policy import (
+        CUT_MARK,
         SendBudget,
         allowlist_problem,
         chunk_bytes,
@@ -49,6 +55,10 @@ else:
         node_id,
         parse_allowlist,
         parse_url,
+        plaintext_restart,
+        radio_approval_text,
+        radio_command_refusal,
+        widens_approval,
     )
     from radio import (
         close_interface,
@@ -64,6 +74,48 @@ else:
 _reply_node: contextvars.ContextVar[str] = contextvars.ContextVar("meshtastic_reply_node", default="")
 _from_radio: contextvars.ContextVar[bool] = contextvars.ContextVar("meshtastic_from_radio", default=False)
 PLATFORM = "meshtastic-gateway"
+# Hermes waits 15 seconds for an approval question to be sent. This send must end before that.
+APPROVAL_SEND_SECONDS = 12
+APPROVAL_SCOPE_REFUSAL = (
+    "Over the radio, approval is one time only. always and session are refused. "
+    "Send /approve to allow this once, or /deny."
+)
+APPROVAL_WORD_REFUSAL = APPROVAL_SCOPE_REFUSAL + " To send the word itself, add more words."
+COMMAND_REFUSAL = (
+    "Over the radio, only these commands are accepted: /approve (once only), /deny, /stop, "
+    "/new, /reset, /help, /status, /whoami, /retry, /undo."
+)
+
+
+def _text_as_hermes_reads_it(event: MessageEvent, text: str) -> str:
+    """The text after Hermes' own plain-text rewrite (for example "restart gateway" becomes /restart).
+
+    The allowlist must see what Hermes will see. If the rewrite cannot be loaded, the same
+    restart phrases are read as /restart here, so the check stays closed.
+    """
+    if plaintext_restart(text):
+        return "/restart"
+    try:
+        from gateway.platforms.base import coerce_plaintext_gateway_command
+    except Exception:
+        return text
+    coerce_plaintext_gateway_command(event)
+    return getattr(event, "text", None) or text
+
+
+def _approval_scope_phrases() -> tuple[str, ...]:
+    """Hermes' own words for session and always approval, in the active language, when Hermes exposes them."""
+    try:
+        from gateway.run_busy import approval_input_words
+    except Exception:
+        return ()
+    words: list[str] = []
+    for key in ("always", "session", "confirm_always"):
+        try:
+            words.extend(approval_input_words(key))
+        except Exception:
+            continue
+    return tuple(words)
 
 
 def _env(config: PlatformConfig, name: str) -> str:
@@ -90,9 +142,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._listener = None
         self._lost = None
         self._send_tasks: set[asyncio.Task] = set()
-        self._turn_task: asyncio.Task | None = None
+        self._turn_tasks: dict[asyncio.Task, str | None] = {}
         self._turn_nodes: dict[str, int] = {}
-        self._turn_packet_id: str | None = None
+        # One send at a time, so chunks of two replies never interleave and the gap holds.
+        self._send_lock = asyncio.Lock()
+        # Set by the library's connection-lost event. A send then fails at once instead of
+        # waiting up to 30 seconds inside the library for a link that is gone.
+        self._radio_lost = False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -129,8 +185,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
             task = asyncio.current_task()
             if task is not None and task not in self._send_tasks:
                 node = _reply_node.get()
+                packet_id = getattr(event, "message_id", None)
                 self._send_tasks.add(task)
-                self._turn_task = task
+                self._turn_tasks[task] = packet_id if isinstance(packet_id, str) else None
                 self._hold_turn_node(node)
                 task.add_done_callback(lambda done, node=node: self._end_turn_task(done, node))
             return await handler(event)
@@ -150,10 +207,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
     def _end_turn_task(self, task: asyncio.Task, node: str = "") -> None:
         self._send_tasks.discard(task)
+        self._turn_tasks.pop(task, None)
         self._release_turn_node(node)
-        if self._turn_task is task:
-            self._turn_task = None
-            self._turn_packet_id = None
 
     def _may_send(self, dest: str, metadata: dict | None) -> bool:
         """The turn task may send the final reply. An approval question for that same node may also be sent. A nested task may not."""
@@ -166,14 +221,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return False
 
     def _forget_failed_reply(self, result: SendResult) -> SendResult:
-        """A reply that never reached the radio is not treated as already seen."""
-        if asyncio.current_task() is not self._turn_task or result.success:
+        """A reply that never reached the radio is not treated as already seen. Each turn forgets only its own packet."""
+        task = asyncio.current_task()
+        if task not in self._turn_tasks or result.success:
             return result
         raw = getattr(result, "raw_response", None)
         sent = raw.get("chunks_sent") if isinstance(raw, dict) else 0
         if isinstance(sent, int) and not isinstance(sent, bool) and sent > 0:
             return result
-        self._forget_seen(self._turn_packet_id)
+        self._forget_seen(self._turn_tasks.get(task))
         return result
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
@@ -195,6 +251,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if "Nothing is connected" not in detail:
                 detail = f"{detail} Nothing is connected."
             raise ValueError(detail) from exc
+        self._radio_lost = False
         try:
             self._listener = subscribe(self._iface, self._on_packet)
             self._lost = subscribe_lost(self._iface, self._on_connection_lost)
@@ -227,6 +284,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 close_interface(iface)
 
     def _on_connection_lost(self) -> None:
+        self._radio_lost = True
         if not self._running:
             return
         self._set_fatal_error(
@@ -301,12 +359,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
         task = asyncio.current_task()
         if task is not None:
             self._send_tasks.add(task)
-        starting = not self._turn_nodes
-        if starting:
-            self._turn_packet_id = packet_id if isinstance(packet_id, str) else None
         self._hold_turn_node(item["node"])
         radio = _from_radio.set(True)
         try:
+            refusal = None
+            kind = radio_command_refusal(_text_as_hermes_reads_it(event, item["text"]))
+            if kind == "approve":
+                # Hermes would keep a session or always approval. A radio node may approve once only.
+                refusal = APPROVAL_SCOPE_REFUSAL
+            elif kind == "command":
+                # /yolo, /approvals and the rest can change approval for the session or the whole profile.
+                refusal = COMMAND_REFUSAL
+            elif widens_approval(item["text"], _approval_scope_phrases()):
+                refusal = APPROVAL_WORD_REFUSAL
+            if refusal is not None:
+                await self.send(item["node"], refusal)
+                return
             await self.handle_message(event)
         finally:
             _from_radio.reset(radio)
@@ -314,8 +382,6 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if task is not None:
                 self._send_tasks.discard(task)
             self._release_turn_node(item["node"])
-            if starting and self._turn_task is None and not self._background_tasks:
-                self._turn_packet_id = None
 
     async def send(
         self,
@@ -327,7 +393,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         dest = node_id(chat_id)
         if dest is None or not is_allowed(dest, self._allowlist()):
             return SendResult(success=False, error="This node is not on the allowlist. Nothing was sent.", retryable=False)
-        if self._iface is None:
+        if self._iface is None or not self._radio_up():
             return self._forget_failed_reply(
                 SendResult(success=False, error="The radio is not connected. Nothing was sent.", retryable=False)
             )
@@ -339,24 +405,93 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
         limit = max_chunks(_env(self.config, "MESHTASTIC_MAX_CHUNKS") or 4)
-        chunks, cut = chunk_text(content or "", size, limit)
+        approval = (metadata or {}).get("is_approval_prompt") is True
+        if approval:
+            # One short chunk: the long Hermes question would need several gaps, and only once is accepted here.
+            chunks, cut = chunk_text(radio_approval_text(content), size, 1)
+        else:
+            chunks, cut = chunk_text(content or "", size, limit)
         if not chunks:
             return self._forget_failed_reply(
                 SendResult(success=False, error="The reply is empty. Nothing was sent.", retryable=False)
+            )
+        started = time.monotonic()
+        if approval:
+            # Hermes stops waiting for an approval send after 15 seconds and does not cancel it.
+            # A send it counted as failed must never go out later, so the wait for the lock is capped.
+            try:
+                await asyncio.wait_for(self._send_lock.acquire(), timeout=APPROVAL_SEND_SECONDS)
+            except asyncio.TimeoutError:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "The approval question was not sent. Another radio send is still going out, "
+                        "and Hermes stops waiting for this send after 15 seconds."
+                    ),
+                    retryable=False,
+                )
+        else:
+            await self._send_lock.acquire()
+        try:
+            return await self._send_locked(dest, chunks, cut, approval, started)
+        finally:
+            self._send_lock.release()
+
+    def _radio_up(self) -> bool:
+        """False after the library reported the link lost, or while its isConnected flag is down."""
+        if self._radio_lost:
+            return False
+        flag = getattr(self._iface, "isConnected", None)
+        if flag is None:
+            return True
+        is_set = getattr(flag, "is_set", None)
+        if callable(is_set):
+            return bool(is_set())
+        return bool(flag)
+
+    async def _send_locked(
+        self, dest: str, chunks: list[str], cut: bool, approval: bool, started: float
+    ) -> SendResult:
+        if self._iface is None or not self._radio_up():
+            return self._forget_failed_reply(
+                SendResult(success=False, error="The radio is not connected. Nothing was sent.", retryable=False)
             )
         budget = self._budget_for()
         now = time.time()
         refusal, wait = budget.plan(len(chunks), now)
         if refusal:
             return self._forget_failed_reply(SendResult(success=False, error=refusal, retryable=False))
+        if approval and (time.monotonic() - started) + wait > APPROVAL_SEND_SECONDS:
+            # Not started: it could not go out before Hermes stops waiting.
+            return SendResult(
+                success=False,
+                error=(
+                    f"The approval question was not sent. The radio gap needs {int(wait + 0.999)} more seconds, "
+                    "and Hermes stops waiting for this send after 15 seconds."
+                ),
+                retryable=False,
+            )
         if wait:
             await asyncio.sleep(wait)
         sent: list[str] = []
         for index, chunk in enumerate(chunks):
             if index:
                 await asyncio.sleep(budget.gap)
+            iface = self._iface
+            if iface is None or not self._radio_up():
+                return self._forget_failed_reply(SendResult(
+                    success=False,
+                    error=(
+                        f"Sent {len(sent)} of {len(chunks)}. The radio is not connected. "
+                        "The part already sent is not sent again."
+                    ),
+                    message_id=sent[-1] if sent else None,
+                    retryable=False,
+                    raw_response={"chunks_sent": len(sent)},
+                ))
             try:
-                packet_id = send_text(self._iface, dest, chunk)
+                # Off the event loop: the library can block while the link is down.
+                packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
             except Exception as exc:
                 return self._forget_failed_reply(SendResult(
                     success=False,
@@ -372,8 +507,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
             sent.append(packet_id)
             remember(dest, "out", len(chunk.encode("utf-8")), time.time())
         note = None
-        if cut:
+        if cut and sent and chunks[-1].endswith(CUT_MARK):
             note = "The reply was cut. The chunks that fit were sent, and the last one ends with [cut]."
+        elif cut:
+            note = "The reply was cut. The chunk size is too small to carry [cut], so the last chunk has no mark."
         return SendResult(success=True, message_id=sent[-1] if sent else "", error=note, retryable=False)
 
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -87,12 +88,13 @@ def test_create_adapter_then_handle_message_sends_pong():
         pending = [task for task in list(created._background_tasks) if hasattr(task, "__await__")]
         if pending:
             await asyncio.wait_for(asyncio.gather(*pending), timeout=15)
-        assert [text for _dest, text, _ack in iface.sent] == ["Approve this?", "pong"]
+        asked = adapter.radio_approval_text("Approve this?")
+        assert [text for _dest, text, _ack in iface.sent] == [asked, "pong"]
 
         refused = await created.send("!aabbccdd", "later")
         assert refused.success is False
         assert "Unsolicited" in (refused.error or "")
-        assert [text for _dest, text, _ack in iface.sent] == ["Approve this?", "pong"]
+        assert [text for _dest, text, _ack in iface.sent] == [asked, "pong"]
 
         created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "8"
         created.config.extra["MESHTASTIC_MAX_CHUNKS"] = "1"
@@ -297,7 +299,7 @@ def test_a_reply_that_never_reaches_the_radio_can_be_accepted_again(monkeypatch)
 
 
 class _NoWaitBudget:
-    gap = 0
+    gap = 10  # only waited between chunks of one reply; these tests send one chunk each
 
     def plan(self, _chunks, _now):
         return None, 0
@@ -352,8 +354,8 @@ def test_two_nodes_talking_at_once_both_get_their_approval_question(monkeypatch)
     assert results["!aabbccdd"].success is True
     assert results["!11223344"].success is True
     assert sorted(text for _dest, text, _ack in iface.sent) == sorted([
-        "Approve for !aabbccdd?",
-        "Approve for !11223344?",
+        adapter.radio_approval_text("Approve for !aabbccdd?"),
+        adapter.radio_approval_text("Approve for !11223344?"),
         "final !aabbccdd",
         "final !11223344",
     ])
@@ -391,3 +393,370 @@ def test_a_task_made_in_the_turn_cannot_send_after_the_turn(monkeypatch):
     assert box["late"].success is False
     assert "Unsolicited" in (box["late"].error or "")
     assert [text for _dest, text, _ack in iface.sent] == ["pong"]
+
+
+def test_radio_cannot_approve_for_the_session_or_always(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    handed = []
+
+    async def handler(event):
+        handed.append(event.text)
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        for number, text in enumerate(("/approve always", "/approve session", "always", "/always"), start=40):
+            await created._accept({"node": "!aabbccdd", "text": text, "channel": False, "packet_id": str(number)})
+        await created._accept({"node": "!aabbccdd", "text": "/approve", "channel": False, "packet_id": "49"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert [text for _dest, text, _ack in iface.sent] == [
+        adapter.APPROVAL_SCOPE_REFUSAL,
+        adapter.APPROVAL_SCOPE_REFUSAL,
+        adapter.APPROVAL_WORD_REFUSAL,
+        adapter.COMMAND_REFUSAL,
+    ]
+    assert "/approve" in handed[0]
+    assert not any(word in " ".join(handed) for word in ("always", "session"))
+
+
+def test_a_chunk_too_small_for_the_cut_mark_does_not_claim_it(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "4"
+    created.config.extra["MESHTASTIC_MAX_CHUNKS"] = "1"
+
+    async def run():
+        token = adapter._reply_node.set("!aabbccdd")
+        created._send_tasks.add(asyncio.current_task())
+        try:
+            return await created.send("!aabbccdd", "abcdefghij")
+        finally:
+            created._send_tasks.discard(asyncio.current_task())
+            adapter._reply_node.reset(token)
+
+    result = asyncio.run(run())
+    assert result.success is True
+    assert [text for _dest, text, _ack in iface.sent] == ["abcd"]
+    assert "too small to carry [cut]" in (result.error or "")
+    assert "ends with [cut]" not in (result.error or "")
+
+
+def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    cfg = _config()
+    cfg.extra["MESHTASTIC_MIN_GAP_SECONDS"] = "20"
+    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    iface = _Iface()
+    created._iface = iface
+    box = {}
+
+    async def ask(text):
+        started = time.monotonic()
+        result = await asyncio.create_task(created.send(
+            "!aabbccdd", text, metadata={"is_approval_prompt": True}))
+        return result, time.monotonic() - started
+
+    async def handler(_event):
+        # Nothing sent yet: a long question is cut to the one chunk that goes out at once.
+        box["long"] = await ask("x" * 500)
+        # The 20 second gap is longer than Hermes waits, so nothing is sent and nothing waits.
+        box["blocked"] = await ask("Approve this?")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "hello", "channel": False, "packet_id": "61"})
+        await _finish_turns(created)
+        # Long after the refusal, nothing more has gone out.
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
+    long_result, long_seconds = box["long"]
+    blocked_result, blocked_seconds = box["blocked"]
+    assert long_result.success is True and long_seconds < 2
+    assert blocked_result.success is False and blocked_seconds < 2
+    assert "Hermes stops waiting" in (blocked_result.error or "")
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert len(sent) == 1
+    assert sent[0].endswith(" [cut]") and len(sent[0].encode("utf-8")) <= 200
+
+
+def test_each_node_forgets_only_its_own_packet(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    cfg = _config()
+    cfg.extra["MESHTASTIC_ALLOWED_NODES"] = "!aabbccdd,!11223344"
+    created = platform_registry.create_adapter("meshtastic-gateway", cfg)
+    created._budget = _NoWaitBudget()
+
+    class _HalfIface(_Iface):
+        def sendText(self, text, destinationId, wantAck=False):
+            if destinationId == "!aabbccdd":
+                raise ConnectionError("down")
+            return super().sendText(text, destinationId, wantAck)
+
+    created._iface = _HalfIface()
+    created._seen = ["71", "72"]
+
+    async def run():
+        second_done = asyncio.Event()
+
+        async def handler(event):
+            if event.source.chat_id == "!aabbccdd":
+                await asyncio.wait_for(second_done.wait(), timeout=10)
+            else:
+                asyncio.get_running_loop().call_soon(second_done.set)
+            return f"final {event.source.chat_id}"
+
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "first", "channel": False, "packet_id": "71"})
+        await created._accept({"node": "!11223344", "text": "second", "channel": False, "packet_id": "72"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    # The first node's reply never reached the radio, so only its packet is forgotten.
+    assert created._seen == ["72"]
+    assert [text for _dest, text, _ack in created._iface.sent] == ["final !11223344"]
+
+
+def test_radio_commands_outside_the_list_never_reach_hermes(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    handed = []
+
+    async def handler(event):
+        handed.append(event.text)
+        return None
+
+    refused = ["/yolo", "/approvals off", "/APPROVALS OFF", "!yolo", "/yolo@bot"]
+    passed = ["/status", "/help@bot", "/deny not now", "/approve once", "hello there"]
+
+    async def run():
+        created.set_message_handler(handler)
+        for number, text in enumerate(refused + passed, start=80):
+            await created._accept({"node": "!aabbccdd", "text": text, "channel": False, "packet_id": str(number)})
+            await _finish_turns(created)
+
+    asyncio.run(run())
+    assert [text for _dest, text, _ack in iface.sent] == [adapter.COMMAND_REFUSAL] * len(refused)
+    assert not any("yolo" in text or "approvals" in text.lower() for text in handed)
+    for text in passed:
+        assert any(text in seen for seen in handed), text
+
+
+def test_hermes_text_approval_question_goes_out_as_one_short_chunk(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.run import _format_exec_approval_fallback
+
+    question = _format_exec_approval_fallback("rm -rf /tmp/build-cache && make clean", "recursive delete", "/")
+    assert len(question.encode("utf-8")) > 200
+    long_question = _format_exec_approval_fallback("echo " + "x" * 300, "long command", "/")
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    results = []
+
+    async def handler(_event):
+        for text in (question, long_question):
+            results.append(await asyncio.create_task(created.send(
+                "!aabbccdd", text, metadata={"is_approval_prompt": True})))
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "clean up", "channel": False, "packet_id": "91"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert all(result.success for result in results)
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert sent[0] == (
+        "Reply /approve or /deny (once only). Run: rm -rf /tmp/build-cache && make clean — recursive delete"
+    )
+    assert sent[1].startswith("Reply /approve or /deny (once only). Run: echo xxx")
+    assert sent[1].endswith(" [cut]") and len(sent[1].encode("utf-8")) <= 200
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize("own_regex", [True, False])
+def test_plain_text_restart_never_reaches_hermes(monkeypatch, own_regex):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    if not own_regex:
+        # Only Hermes' own rewrite is left to catch the phrase.
+        monkeypatch.setattr(adapter, "plaintext_restart", lambda _text: False)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    handed = []
+
+    async def handler(event):
+        handed.append(event.text)
+        return None
+
+    phrases = ["restart gateway", "please restart hermes", "Restart the Hermes gateway!"]
+
+    async def run():
+        created.set_message_handler(handler)
+        for number, text in enumerate(phrases + ["restart the router"], start=95):
+            await created._accept({"node": "!aabbccdd", "text": text, "channel": False, "packet_id": str(number)})
+            await _finish_turns(created)
+
+    asyncio.run(run())
+    assert [text for _dest, text, _ack in iface.sent] == [adapter.COMMAND_REFUSAL] * len(phrases)
+    assert handed == ["restart the router"]
+
+
+async def _send_in_turn(created, text, **kwargs):
+    token = adapter._reply_node.set("!aabbccdd")
+    created._send_tasks.add(asyncio.current_task())
+    try:
+        return await created.send("!aabbccdd", text, **kwargs)
+    finally:
+        created._send_tasks.discard(asyncio.current_task())
+        adapter._reply_node.reset(token)
+
+
+def test_a_send_after_the_radio_is_lost_fails_at_once(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+
+    class _SlowIface(_Iface):
+        def sendText(self, text, destinationId, wantAck=False):
+            time.sleep(30)  # what the library does while it waits for a lost link
+            return super().sendText(text, destinationId, wantAck)
+
+    iface = _SlowIface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+
+    async def notify():
+        return None
+
+    created._notify_fatal_error = notify
+
+    async def run():
+        created._loop = asyncio.get_running_loop()
+        created._running = True
+        created._on_connection_lost()
+        started = time.monotonic()
+        result = await _send_in_turn(created, "hello")
+        return result, time.monotonic() - started
+
+    result, seconds = asyncio.run(run())
+    assert result.success is False
+    assert "not connected" in (result.error or "")
+    assert result.retryable is False
+    assert seconds < 1
+    assert iface.sent == []
+
+
+def test_a_send_while_the_link_is_down_fails_at_once(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    iface.isConnected = threading.Event()  # the library clears it while the link is down
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+
+    async def run():
+        started = time.monotonic()
+        result = await _send_in_turn(created, "hello")
+        return result, time.monotonic() - started
+
+    result, seconds = asyncio.run(run())
+    assert result.success is False and "not connected" in (result.error or "")
+    assert seconds < 1
+    assert iface.sent == []
+    iface.isConnected.set()
+    assert asyncio.run(_send_in_turn(created, "hello")).success is True
+
+
+def test_a_slow_radio_send_does_not_block_the_event_loop(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+
+    class _SlowIface(_Iface):
+        def sendText(self, text, destinationId, wantAck=False):
+            time.sleep(1.0)
+            return super().sendText(text, destinationId, wantAck)
+
+    created._iface = _SlowIface()
+    created._budget = _NoWaitBudget()
+
+    async def run():
+        ticks = 0
+        done = asyncio.Event()
+
+        async def ticker():
+            nonlocal ticks
+            while not done.is_set():
+                ticks += 1
+                await asyncio.sleep(0.05)
+
+        tick_task = asyncio.create_task(ticker())
+        result = await _send_in_turn(created, "hello")
+        done.set()
+        await tick_task
+        return result, ticks
+
+    result, ticks = asyncio.run(run())
+    assert result.success is True
+    assert ticks >= 10
+
+
+def test_an_approval_question_does_not_wait_past_its_limit_for_another_send(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.3)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+
+    class _SlowIface(_Iface):
+        def sendText(self, text, destinationId, wantAck=False):
+            time.sleep(1.0)
+            return super().sendText(text, destinationId, wantAck)
+
+    iface = _SlowIface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+
+    async def run():
+        reply = asyncio.create_task(_send_in_turn(created, "final reply"))
+        await asyncio.sleep(0.1)  # the reply now holds the radio
+        created._turn_nodes["!aabbccdd"] = 1
+        created._send_tasks.add(reply)
+        started = time.monotonic()
+        asked = await asyncio.create_task(created.send(
+            "!aabbccdd", "Approve this?", metadata={"is_approval_prompt": True}))
+        waited = time.monotonic() - started
+        await reply
+        await asyncio.sleep(0.2)
+        return asked, waited
+
+    asked, waited = asyncio.run(run())
+    assert asked.success is False and "Hermes stops waiting" in (asked.error or "")
+    assert waited < 0.9
+    assert [text for _dest, text, _ack in iface.sent] == ["final reply"]

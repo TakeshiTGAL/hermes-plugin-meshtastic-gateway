@@ -6,6 +6,7 @@ is under Meshtastic's DATA_PAYLOAD_LEN of 233.
 """
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 BROADCAST = 0xFFFFFFFF
@@ -285,9 +286,14 @@ def parse_url(raw: object) -> dict:
         host = parsed.hostname
         if not host or parsed.path not in {"", "/"}:
             raise ValueError("tcp:// URL must be host and optional port only, for example tcp://radio.example:4403.")
-        port = parsed.port or 4403
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
+        if port is None:
+            port = 4403
         if not 1 <= port <= 65535:
-            raise ValueError("tcp port is out of range.")
+            raise ValueError("tcp port must be a number from 1 to 65535, for example tcp://radio.example:4403.")
         return {"kind": "tcp", "host": host, "port": port}
     if scheme == "serial":
         path = parsed.path or ""
@@ -300,3 +306,110 @@ def parse_url(raw: object) -> dict:
             raise ValueError("ble:// URL must be a single device name or address, for example ble://radio.example.")
         return {"kind": "ble", "name": name}
     raise ValueError("MESHTASTIC_URL must start with tcp://, serial://, or ble://.")
+
+
+# Hermes keeps these approvals past the one command: "session" for the session, "always" in command_allowlist.
+APPROVAL_SCOPE_WORDS = frozenset({"always", "permanent", "permanently", "session", "ses"})
+WIDE_APPROVAL_PHRASES = frozenset({
+    "always", "session", "remember",
+    "approve always", "always approve", "approve session", "session approve",
+})
+_ATTACHMENT_REFS = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
+
+
+def widens_approval(text: object, extra_phrases: object = ()) -> bool:
+    """True when the text would approve for the session or permanently, not just once.
+
+    Covers /approve with session or always (and their aliases), /always and /remember,
+    and a message that is only one of Hermes' session or always words.
+    """
+    body = _ATTACHMENT_REFS.sub("", str(text or "").lstrip())
+    body = " ".join(body.lower().split())
+    if not body:
+        return False
+    phrases = set(WIDE_APPROVAL_PHRASES)
+    for phrase in extra_phrases or ():
+        phrases.add(" ".join(str(phrase).lower().split()))
+    if body in phrases or body.lstrip("!/").strip() in phrases:
+        return True
+    if body[0] not in "/!":
+        return False
+    words = body[1:].split()
+    if not words:
+        return False
+    head = words[0].split("@", 1)[0]
+    if head in {"always", "remember"}:
+        return True
+    return head == "approve" and any(word in APPROVAL_SCOPE_WORDS for word in words[1:])
+
+
+# Slash commands a radio node may send. Each exists in Hermes v0.21.4 and main.
+# The rest are refused before Hermes sees them: /yolo skips approval for the session,
+# /approvals changes approval for the whole profile.
+RADIO_COMMANDS = ("approve", "deny", "stop", "new", "reset", "help", "status", "whoami", "retry", "undo")
+
+
+def radio_command_refusal(text: object) -> str | None:
+    """None when the text is not a command or is a radio command. Otherwise "approve" or "command".
+
+    A text starting with / or ! is a command. The name is lower-cased and loses any @bot.
+    /approve passes with no argument or with once only. A /path with a second / is not a command.
+    """
+    body = _ATTACHMENT_REFS.sub("", str(text or "").lstrip()).lstrip()
+    if not body or body[0] not in "/!":
+        return None
+    words = body[1:].split()
+    if not words:
+        return None
+    name = words[0].lower().split("@", 1)[0]
+    if body[0] == "/" and "/" in name:
+        return None
+    if name == "approve":
+        if all(word.lower() == "once" for word in words[1:]):
+            return None
+        return "approve"
+    if name in RADIO_COMMANDS:
+        return None
+    return "command"
+
+
+APPROVAL_PREFIX = "Reply /approve or /deny (once only). "
+_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)\n?```", re.DOTALL)
+
+
+def radio_approval_text(text: object) -> str:
+    """Hermes' approval question, made short for one radio chunk.
+
+    "Reply /approve or /deny (once only). Run: <command> — <reason>". Without a code block,
+    the prefix goes in front of the original text.
+    """
+    raw = str(text or "")
+    match = _CODE_BLOCK.search(raw)
+    if match is None:
+        return APPROVAL_PREFIX + raw.strip()
+    command = match.group(1).strip()
+    reason = ""
+    for line in raw[match.end():].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        label, sep, rest = line.partition(": ")
+        reason = rest.strip() if sep else ("" if line.endswith(":") else line)
+        break
+    out = f"{APPROVAL_PREFIX}Run: {command}"
+    return f"{out} — {reason}" if reason else out
+
+
+# Hermes rewrites these plain-text phrases to /restart before it reads the command
+# (gateway.platforms.base, v0.21.4 and main). Used when that function cannot be imported.
+_PLAINTEXT_RESTART = (
+    re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$", re.IGNORECASE),
+    re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$", re.IGNORECASE),
+    re.compile(r"^(?:please\s+)?restart\s+hermes[.!?\s]*$", re.IGNORECASE),
+)
+
+
+def plaintext_restart(text: object) -> bool:
+    """True when Hermes would turn this plain text into /restart."""
+    body = str(text or "").strip()
+    return bool(body) and not body.startswith("/") and any(p.match(body) for p in _PLAINTEXT_RESTART)
