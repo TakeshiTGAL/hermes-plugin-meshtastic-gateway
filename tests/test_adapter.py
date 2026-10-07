@@ -96,7 +96,7 @@ def test_create_adapter_then_handle_message_sends_pong():
         assert "Unsolicited" in (refused.error or "")
         assert [text for _dest, text, _ack in iface.sent] == [asked, "pong"]
 
-        created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "8"
+        created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "64"
         created.config.extra["MESHTASTIC_MAX_CHUNKS"] = "1"
         token = adapter._reply_node.set("!aabbccdd")
         created._send_tasks.add(asyncio.current_task())
@@ -108,7 +108,7 @@ def test_create_adapter_then_handle_message_sends_pong():
 
             adapter.asyncio.sleep = no_wait
             try:
-                cut = await created.send("!aabbccdd", "abcdefghij")
+                cut = await created.send("!aabbccdd", "a" * 100)
             finally:
                 adapter.asyncio.sleep = original
         finally:
@@ -247,7 +247,7 @@ def test_a_chunk_already_on_the_radio_is_final(monkeypatch):
     _register()
     created = platform_registry.create_adapter("meshtastic-gateway", _config())
     created._iface = object()
-    created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "4"
+    created.config.extra["MESHTASTIC_CHUNK_BYTES"] = "64"
     created.config.extra["MESHTASTIC_MAX_CHUNKS"] = "4"
 
     async def run():
@@ -260,7 +260,7 @@ def test_a_chunk_already_on_the_radio_is_final(monkeypatch):
 
         adapter.asyncio.sleep = no_wait
         try:
-            return await created.send("!aabbccdd", "abcdefghij")
+            return await created.send("!aabbccdd", "a" * 100)
         finally:
             adapter.asyncio.sleep = original
             created._send_tasks.discard(asyncio.current_task())
@@ -426,7 +426,7 @@ def test_radio_cannot_approve_for_the_session_or_always(monkeypatch):
     assert not any(word in " ".join(handed) for word in ("always", "session"))
 
 
-def test_a_chunk_too_small_for_the_cut_mark_does_not_claim_it(monkeypatch):
+def test_a_chunk_size_below_the_floor_is_read_as_64(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
     created = platform_registry.create_adapter("meshtastic-gateway", _config())
@@ -440,16 +440,17 @@ def test_a_chunk_too_small_for_the_cut_mark_does_not_claim_it(monkeypatch):
         token = adapter._reply_node.set("!aabbccdd")
         created._send_tasks.add(asyncio.current_task())
         try:
-            return await created.send("!aabbccdd", "abcdefghij")
+            return await created.send("!aabbccdd", "a" * 100)
         finally:
             created._send_tasks.discard(asyncio.current_task())
             adapter._reply_node.reset(token)
 
     result = asyncio.run(run())
     assert result.success is True
-    assert [text for _dest, text, _ack in iface.sent] == ["abcd"]
-    assert "too small to carry [cut]" in (result.error or "")
-    assert "ends with [cut]" not in (result.error or "")
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert len(sent) == 1 and len(sent[0].encode("utf-8")) == 64
+    assert sent[0].endswith(" [cut]")
+    assert "ends with [cut]" in (result.error or "")
 
 
 def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypatch):
@@ -469,10 +470,12 @@ def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypat
         return result, time.monotonic() - started
 
     async def handler(_event):
-        # Nothing sent yet: a long question is cut to the one chunk that goes out at once.
+        # A question that does not fit one chunk is not sent at all.
         box["long"] = await ask("x" * 500)
+        # A short one goes out at once.
+        box["short"] = await ask("Approve this?")
         # The 20 second gap is longer than Hermes waits, so nothing is sent and nothing waits.
-        box["blocked"] = await ask("Approve this?")
+        box["blocked"] = await ask("Approve that?")
         return None
 
     async def run():
@@ -484,13 +487,15 @@ def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypat
 
     asyncio.run(run())
     long_result, long_seconds = box["long"]
+    short_result, short_seconds = box["short"]
     blocked_result, blocked_seconds = box["blocked"]
-    assert long_result.success is True and long_seconds < 2
+    assert long_result.success is False and long_seconds < 2
+    assert long_result.error == "approval question does not fit one radio chunk"
+    assert long_result.retryable is False
+    assert short_result.success is True and short_seconds < 2
     assert blocked_result.success is False and blocked_seconds < 2
     assert "Hermes stops waiting" in (blocked_result.error or "")
-    sent = [text for _dest, text, _ack in iface.sent]
-    assert len(sent) == 1
-    assert sent[0].endswith(" [cut]") and len(sent[0].encode("utf-8")) <= 200
+    assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_text("Approve this?")]
 
 
 def test_each_node_forgets_only_its_own_packet(monkeypatch):
@@ -560,7 +565,7 @@ def test_radio_commands_outside_the_list_never_reach_hermes(monkeypatch):
         assert any(text in seen for seen in handed), text
 
 
-def test_hermes_text_approval_question_goes_out_as_one_short_chunk(monkeypatch, tmp_path):
+def test_hermes_text_approval_question_goes_out_only_when_it_fits_one_chunk(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     from gateway.run import _format_exec_approval_fallback
@@ -587,14 +592,14 @@ def test_hermes_text_approval_question_goes_out_as_one_short_chunk(monkeypatch, 
         await _finish_turns(created)
 
     asyncio.run(run())
-    assert all(result.success for result in results)
-    sent = [text for _dest, text, _ack in iface.sent]
-    assert sent[0] == (
+    # The short command fits one chunk and goes out. The long one does not fit, so it is not sent,
+    # and Hermes closes that approval itself.
+    assert results[0].success is True
+    assert results[1].success is False
+    assert results[1].error == "approval question does not fit one radio chunk"
+    assert [text for _dest, text, _ack in iface.sent] == [
         "Reply /approve or /deny (once only). Run: rm -rf /tmp/build-cache && make clean — recursive delete"
-    )
-    assert sent[1].startswith("Reply /approve or /deny (once only). Run: echo xxx")
-    assert sent[1].endswith(" [cut]") and len(sent[1].encode("utf-8")) <= 200
-    assert len(sent) == 2
+    ]
 
 
 @pytest.mark.parametrize("own_regex", [True, False])
@@ -760,3 +765,48 @@ def test_an_approval_question_does_not_wait_past_its_limit_for_another_send(monk
     assert asked.success is False and "Hermes stops waiting" in (asked.error or "")
     assert waited < 0.9
     assert [text for _dest, text, _ack in iface.sent] == ["final reply"]
+
+
+def test_hermes_closes_an_approval_whose_question_did_not_fit(monkeypatch, tmp_path):
+    """Hermes' own approval wait, fed through this adapter: the long question is not sent, and the
+    command is refused when the approval wait ends."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.run import _format_exec_approval_fallback
+    from tools import approval_context
+    from tools.approval_gateway_wait import _await_gateway_decision
+
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 1)
+    _register()
+    created = platform_registry.create_adapter("meshtastic-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    command = "echo " + "x" * 300
+    question = _format_exec_approval_fallback(command, "long command", "/")
+    seen = {}
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        turn = asyncio.create_task(asyncio.sleep(10))  # the turn this approval belongs to
+        created._send_tasks.add(turn)
+        created._turn_nodes["!aabbccdd"] = 1
+
+        def notify(_data):
+            # Hermes' text path: send, wait up to 15 seconds, and do not raise on a failed send.
+            future = asyncio.run_coroutine_threadsafe(
+                created.send("!aabbccdd", question, metadata={"is_approval_prompt": True}), loop)
+            seen["send"] = future.result(timeout=15)
+
+        decision = await asyncio.to_thread(
+            _await_gateway_decision, "radio-session", notify,
+            {"command": command, "description": "long command", "pattern_key": "k", "pattern_keys": ["k"]})
+        turn.cancel()
+        return decision
+
+    decision = asyncio.run(run())
+    assert seen["send"].success is False
+    assert seen["send"].error == "approval question does not fit one radio chunk"
+    assert iface.sent == []
+    assert decision.get("resolved") is False
+    assert decision.get("choice") in (None, "deny", "timeout")

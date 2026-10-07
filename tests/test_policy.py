@@ -65,14 +65,22 @@ def test_own_node_and_non_text_are_dropped():
 
 
 def test_chunks_are_utf8_bytes_and_cut():
-    parts, cut = chunk_text("a" * 10, 4, 2)
+    parts, cut = chunk_text("a" * 200, 64, 2)
     assert cut is True
-    assert all(len(part.encode("utf-8")) <= 4 for part in parts)
+    assert all(len(part.encode("utf-8")) <= 64 for part in parts)
     assert len(parts) <= 2
+    assert parts[-1].endswith(" [cut]")
     snow = "❄"  # 3 bytes
-    parts, cut = chunk_text(snow * 3, 4, 8)
+    parts, cut = chunk_text(snow * 30, 64, 8)
     assert cut is False
-    assert all(len(part.encode("utf-8")) <= 4 for part in parts)
+    assert all(len(part.encode("utf-8")) <= 64 for part in parts)
+
+
+def test_chunk_size_floor_fits_the_approval_prefix():
+    assert policy.chunk_bytes(1) == 64
+    assert policy.chunk_bytes("0") == 64
+    prefix = (policy.APPROVAL_PREFIX + "Run: ").encode("utf-8")
+    assert len(prefix) < policy.CHUNK_BYTES_FLOOR
 
 
 def test_url_pins_one_device():

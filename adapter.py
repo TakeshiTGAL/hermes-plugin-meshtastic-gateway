@@ -409,6 +409,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if approval:
             # One short chunk: the long Hermes question would need several gaps, and only once is accepted here.
             chunks, cut = chunk_text(radio_approval_text(content), size, 1)
+            if cut:
+                # Nobody may approve a command they could not read in full. Hermes then fails closed
+                # (notify_failed or the approval timeout).
+                return SendResult(
+                    success=False,
+                    retryable=False,
+                    error="approval question does not fit one radio chunk",
+                )
         else:
             chunks, cut = chunk_text(content or "", size, limit)
         if not chunks:
@@ -538,7 +546,10 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=["MESHTASTIC_URL"],
-        install_hint="Install meshtastic into the Hermes virtualenv (GPL-3.0-only). This plugin does not vendor it.",
+        install_hint=(
+            "meshtastic>=2.7.9,<3 (GPL-3.0-only) is declared in python_dependencies, so Hermes installs it "
+            "with the plugin. It is not vendored."
+        ),
         allowed_users_env="MESHTASTIC_ALLOWED_NODES",
         max_message_length=800,
         emoji="📻",

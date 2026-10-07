@@ -11,6 +11,9 @@ from urllib.parse import urlparse
 
 BROADCAST = 0xFFFFFFFF
 CHUNK_BYTES_CEILING = 200
+# The approval prefix "Reply /approve or /deny (once only). Run: " is 42 bytes. The floor leaves room for it
+# and a short command, so a short approval question can still go out in one chunk.
+CHUNK_BYTES_FLOOR = 64
 MAX_CHUNKS_CEILING = 8
 MIN_GAP_FLOOR_SECONDS = 10
 MAX_PER_HOUR_CEILING = 30
@@ -32,7 +35,7 @@ def _clamp_int(value: object, default: int, low: int, high: int) -> int:
 
 
 def chunk_bytes(value: object) -> int:
-    return _clamp_int(value, DEFAULT_CHUNK_BYTES, 1, CHUNK_BYTES_CEILING)
+    return _clamp_int(value, DEFAULT_CHUNK_BYTES, CHUNK_BYTES_FLOOR, CHUNK_BYTES_CEILING)
 
 
 def max_chunks(value: object) -> int:
