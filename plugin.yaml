@@ -6,7 +6,7 @@ python_dependencies:
   - "meshtastic>=2.7.9,<3"
 kind: platform
 description: >-
-  Talk to Hermes over a radio, built on the Meshtastic Python API.
+  Talk to Hermes over a radio, built on the Meshtastic® Python API.
   Meshtastic® is a registered trademark of Meshtastic LLC. An allowlisted
   direct message is answered only when pkiEncrypted
   is true. An empty allowlist answers nobody. Channel packets are never

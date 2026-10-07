@@ -217,3 +217,48 @@ def test_plain_text_restart_phrases_are_read_as_restart():
         assert policy.plaintext_restart(text) is True, text
     for text in ("restart the router", "can you restart gateway later", "/restart", ""):
         assert policy.plaintext_restart(text) is False, text
+
+
+def test_node_id_rejects_values_outside_32_bits():
+    assert node_id("!1aabbccdd") is None
+    assert node_id("!1aabbccdd") != "!aabbccdd"
+    assert node_id(0x1AABBCCDD) is None
+    assert node_id(0x100000001) is None
+    assert node_id(-5) is None
+    assert node_id(-5) != "!fffffffb"
+    assert node_id("!-5") is None
+    assert node_id(-1) is None
+    assert node_id(0x100000000) is None
+    assert node_id("!aabbccdd") == "!aabbccdd"
+    assert node_id("!000000010") == "!00000010"
+    assert node_id("!000000001") == "!00000001"
+    assert parse_allowlist("!1aabbccdd") == frozenset()
+    assert parse_allowlist("!1aabbccdd, !aabbccdd") == frozenset()
+
+
+def test_missing_from_id_uses_the_number():
+    missing = dict(SENDER)
+    missing["fromId"] = None
+    missing["from"] = 0xAABBCCDD
+    got = classify(missing, ALLOW, my_node="!11223344")
+    assert got is not None and got["node"] == "!aabbccdd"
+
+    bang = dict(SENDER)
+    bang["fromId"] = None
+    bang["from"] = "!aabbccdd"
+    assert classify(bang, ALLOW, my_node="!11223344")["node"] == "!aabbccdd"
+
+    dropped = dict(SENDER)
+    dropped["fromId"] = None
+    dropped.pop("from", None)
+    assert classify(dropped, ALLOW, my_node="!11223344") is None
+
+    to_number = dict(SENDER)
+    to_number["toId"] = None
+    to_number["to"] = 0x11223344
+    assert classify(to_number, ALLOW, my_node="!11223344")["node"] == "!aabbccdd"
+
+    to_gone = dict(SENDER)
+    to_gone["toId"] = None
+    to_gone.pop("to", None)
+    assert classify(to_gone, ALLOW, my_node="!11223344") is None

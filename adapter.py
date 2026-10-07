@@ -144,6 +144,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._send_tasks: set[asyncio.Task] = set()
         self._turn_tasks: dict[asyncio.Task, str | None] = {}
         self._turn_nodes: dict[str, int] = {}
+        # The handler task only, and only until the handler returns. Hermes sends the final reply after that.
+        self._in_handler: set[asyncio.Task] = set()
         # One send at a time, so chunks of two replies never interleave and the gap holds.
         self._send_lock = asyncio.Lock()
         # Set by the library's connection-lost event. A send then fails at once instead of
@@ -170,8 +172,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         A chunk already counted as sent is final. A library error during sendText is also final:
         the class name would otherwise match Hermes's retry list (ConnectionResetError and the rest)
         or fall through to a plain-text resend of the whole reply. Either path can put the text on
-        the radio twice. The 30-second and 2-minute ledger retries are a different path; this adapter
-        refuses those because they are outside the turn.
+        the radio twice. The retries about 30 seconds and about 2.5 minutes later are a different path;
+        this adapter refuses those because they are outside the turn.
         """
         raw = getattr(result, "raw_response", None)
         if not isinstance(raw, dict):
@@ -190,20 +192,50 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return self._budget
 
     def set_message_handler(self, handler) -> None:
-        """Remember the task that runs the turn. Nested tasks must not transmit."""
+        """Remember the task that runs the turn. Nested tasks must not transmit.
+
+        Hermes queues a message that arrives during startup and later calls handle_message again
+        from a task that did not copy this adapter's reply context. The event still names the node.
+        """
 
         async def wrapped(event):
             task = asyncio.current_task()
             if task is not None and task not in self._send_tasks:
                 node = _reply_node.get()
+                if not node and self._event_from_this_radio(event):
+                    source = getattr(event, "source", None)
+                    recovered = node_id(getattr(source, "chat_id", None))
+                    if recovered:
+                        _reply_node.set(recovered)
+                        node = recovered
                 packet_id = getattr(event, "message_id", None)
                 self._send_tasks.add(task)
                 self._turn_tasks[task] = packet_id if isinstance(packet_id, str) else None
                 self._hold_turn_node(node)
                 task.add_done_callback(lambda done, node=node: self._end_turn_task(done, node))
-            return await handler(event)
+            if task is not None:
+                self._in_handler.add(task)
+            try:
+                return await handler(event)
+            finally:
+                if task is not None:
+                    self._in_handler.discard(task)
 
         super().set_message_handler(wrapped)
+
+    def _event_from_this_radio(self, event) -> bool:
+        """True only for an event this adapter built. An unstamped event is not a radio reply."""
+        raw = getattr(event, "raw_message", None)
+        if isinstance(raw, dict) and raw.get("radio_dm_origin") is True:
+            return True
+        return getattr(event, "_radio_dm_origin", False) is True
+
+    def _interim_on_this_task(self, metadata: dict | None) -> bool:
+        """Text sent before the handler returns. An approval question is not interim text."""
+        task = asyncio.current_task()
+        if task is None or task not in self._in_handler:
+            return False
+        return (metadata or {}).get("is_approval_prompt") is not True
 
     def _hold_turn_node(self, node: str) -> None:
         if node:
@@ -362,9 +394,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 text=item["text"],
                 message_type=MessageType.TEXT,
                 source=source,
-                raw_message={"node": item["node"], "channel": item["channel"]},
+                raw_message={"node": item["node"], "channel": item["channel"], "radio_dm_origin": True},
                 message_id=packet_id,
             )
+            # Survives the startup queue: Hermes replays this same event from another task.
+            event._radio_dm_origin = True
             token = _reply_node.set(item["node"])
         except Exception:
             self._forget_seen(packet_id)
@@ -406,6 +440,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         dest = node_id(chat_id)
         if dest is None or not is_allowed(dest, self._allowlist()):
             return SendResult(success=False, error="This node is not on the allowlist. Nothing was sent.", retryable=False)
+        if self._interim_on_this_task(metadata):
+            # Do not forget the packet id, and do not spend the send budget. The final reply is still owed.
+            return SendResult(
+                success=False,
+                error="Interim radio text is refused. Nothing was sent.",
+                retryable=False,
+            )
         if self._iface is None or not self._radio_up():
             return self._forget_failed_reply(
                 SendResult(success=False, error="The radio is not connected. Nothing was sent.", retryable=False)
@@ -571,7 +612,7 @@ def register(ctx) -> None:
         emoji="📻",
         allow_update_command=False,
         platform_hint=(
-            "You are answering over a Meshtastic radio. Keep replies short. "
+            "You are answering over a Meshtastic® radio. Keep replies short. "
             "An empty node allowlist means you answer nobody. Do not invent a node id."
         ),
     )

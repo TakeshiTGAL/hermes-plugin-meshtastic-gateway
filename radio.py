@@ -1,4 +1,4 @@
-"""Open one Meshtastic interface and send already-checked text chunks.
+"""Open one Meshtastic® interface and send already-checked text chunks.
 
 The meshtastic package is imported only when a tcp connection is opened.
 This plugin opens tcp only. Serial and BLE cannot be stopped once started,

@@ -872,3 +872,113 @@ def test_hermes_closes_an_approval_whose_question_did_not_fit(monkeypatch, tmp_p
     assert iface.sent == []
     assert decision.get("resolved") is False
     assert decision.get("choice") in (None, "deny", "timeout")
+
+
+def test_a_startup_replay_without_the_reply_context_still_sends(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+
+    async def handler(_event):
+        return "pong-replay"
+
+    async def run():
+        created.set_message_handler(handler)
+        source = created.build_source(
+            chat_id="!aabbccdd",
+            chat_type="dm",
+            user_id="!aabbccdd",
+            user_name="!aabbccdd",
+            message_id="replay-1",
+        )
+        event = adapter.MessageEvent(
+            text="hello",
+            message_type=adapter.MessageType.TEXT,
+            source=source,
+            raw_message={"node": "!aabbccdd", "channel": False, "radio_dm_origin": True},
+            message_id="replay-1",
+        )
+        event._radio_dm_origin = True
+        assert adapter._reply_node.get() == ""
+        await created.handle_message(event)
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert [text for _dest, text, _ack in iface.sent] == ["pong-replay"]
+
+
+def test_an_unstamped_event_is_still_unsolicited(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+
+    async def handler(_event):
+        return "pong"
+
+    async def run():
+        created.set_message_handler(handler)
+        source = created.build_source(
+            chat_id="!aabbccdd",
+            chat_type="dm",
+            user_id="!aabbccdd",
+            user_name="!aabbccdd",
+            message_id="plain-1",
+        )
+        event = adapter.MessageEvent(
+            text="hello",
+            message_type=adapter.MessageType.TEXT,
+            source=source,
+            raw_message={"node": "!aabbccdd", "channel": False},
+            message_id="plain-1",
+        )
+        await created.handle_message(event)
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert iface.sent == []
+
+
+def test_interim_text_during_the_turn_is_refused_and_the_final_reply_is_sent(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    # _accept does not record the id. _on_packet does. Seed it so a mistaken forget is visible.
+    created._seen = ["replay-2"]
+    box = {}
+
+    async def handler(_event):
+        box["interim"] = await created.send(
+            "!aabbccdd",
+            "📬 No home channel is set for Radio_Dm_Gateway. Type /sethome",
+        )
+        box["approval"] = await asyncio.create_task(created.send(
+            "!aabbccdd",
+            "Approve this?",
+            metadata={"is_approval_prompt": True},
+        ))
+        return "pong"
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "hello", "channel": False, "packet_id": "replay-2"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["interim"].success is False
+    assert box["interim"].error == "Interim radio text is refused. Nothing was sent."
+    assert box["approval"].success is True
+    assert [text for _dest, text, _ack in iface.sent] == [
+        adapter.radio_approval_text("Approve this?"),
+        "pong",
+    ]
+    assert "sethome" not in " ".join(text for _dest, text, _ack in iface.sent)
+    assert created._seen == ["replay-2"]

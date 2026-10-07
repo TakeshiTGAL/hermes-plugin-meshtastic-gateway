@@ -2,7 +2,7 @@
 
 No radio, no Hermes import. An empty allowlist matches nobody. A channel
 packet is not a direct message. Chunk size cannot exceed 200 bytes, which
-is under Meshtastic's DATA_PAYLOAD_LEN of 233.
+is under the Meshtastic® DATA_PAYLOAD_LEN of 233.
 """
 from __future__ import annotations
 
@@ -55,6 +55,8 @@ def node_id(value: object) -> str | None:
 
     A leading '!' or '0x' is hexadecimal, including ids whose digits are all 0-9.
     A bare number with no a-f digit is decimal.
+    A negative value, or a value above 0xffffffff, is refused before any mask.
+    '!1aabbccdd' and -5 must not become another node's id.
     """
     if isinstance(value, bool) or value is None:
         return None
@@ -77,7 +79,8 @@ def node_id(value: object) -> str | None:
             number = int(text, base)
         except ValueError:
             return None
-    number &= 0xFFFFFFFF
+    if number < 0 or number > 0xFFFFFFFF:
+        return None
     if number in {0, BROADCAST}:
         return None
     return f"!{number:08x}"
@@ -147,6 +150,19 @@ def _text_from(decoded: dict) -> str | None:
     return text or None
 
 
+def _packet_field(packet: dict, primary: str, fallback: str):
+    """The first field that is present and not None.
+
+    dict.get(primary, packet.get(fallback)) stays None when the key exists and its value is None.
+    The library sets fromId to None when that node is missing from its node database, and leaves the number in `from`.
+    """
+    if primary in packet and packet[primary] is not None:
+        return packet[primary]
+    if fallback in packet and packet[fallback] is not None:
+        return packet[fallback]
+    return None
+
+
 def classify(packet: dict, allowlist: frozenset[str], *, my_node: object = None) -> dict | None:
     """A direct text this gateway may hand to Hermes, or None to drop it.
 
@@ -160,13 +176,13 @@ def classify(packet: dict, allowlist: frozenset[str], *, my_node: object = None)
     port = decoded.get("portnum")
     if port not in {"TEXT_MESSAGE_APP", 1, "1"}:
         return None
-    sender = node_id(packet.get("fromId", packet.get("from")))
+    sender = node_id(_packet_field(packet, "fromId", "from"))
     if sender is None:
         return None
     me = node_id(my_node) if my_node is not None else None
     if me is None or sender == me:
         return None
-    destination = packet.get("toId", packet.get("to"))
+    destination = _packet_field(packet, "toId", "to")
     # A channel key lets anyone impersonate a sender. Channel packets are never answered.
     if is_broadcast(destination):
         return None
