@@ -313,7 +313,7 @@ def test_a_first_chunk_link_drop_is_final_and_names_no_retry_class(monkeypatch):
         assert mark not in low
 
 
-def test_a_reply_that_never_reaches_the_radio_can_be_accepted_again(monkeypatch):
+def test_a_link_drop_keeps_the_packet_id(monkeypatch):
     def send_text(*_args):
         raise ConnectionError("down")
 
@@ -322,6 +322,28 @@ def test_a_reply_that_never_reaches_the_radio_can_be_accepted_again(monkeypatch)
     _register()
     created = platform_registry.create_adapter("radio-dm-gateway", _config())
     created._iface = object()
+    created._seen = ["9"]
+
+    async def handler(_event):
+        return "pong"
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "hello", "channel": False, "packet_id": "9"})
+        pending = [task for task in list(created._background_tasks) if hasattr(task, "__await__")]
+        if pending:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=15)
+
+    asyncio.run(run())
+    assert created._seen == ["9"]
+
+
+def test_a_reply_that_never_calls_send_text_can_be_accepted_again(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    created._iface = object()
+    created._radio_lost = True
     created._seen = ["9"]
 
     async def handler(_event):
@@ -538,7 +560,7 @@ def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypat
     assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_text("Approve this?")]
 
 
-def test_each_node_forgets_only_its_own_packet(monkeypatch):
+def test_one_nodes_link_drop_does_not_drop_the_other_packet(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
     cfg = _config()
@@ -571,8 +593,8 @@ def test_each_node_forgets_only_its_own_packet(monkeypatch):
         await _finish_turns(created)
 
     asyncio.run(run())
-    # The first node's reply never reached the radio, so only its packet is forgotten.
-    assert created._seen == ["72"]
+    # The first send may have reached the radio, so its packet id stays. The other node is untouched.
+    assert created._seen == ["71", "72"]
     assert [text for _dest, text, _ack in created._iface.sent] == ["final !11223344"]
 
 

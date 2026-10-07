@@ -232,11 +232,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return False
 
     def _forget_failed_reply(self, result: SendResult) -> SendResult:
-        """A reply that never reached the radio is not treated as already seen. Each turn forgets only its own packet."""
+        """A reply that never called sendText is not treated as already seen. A send that may have reached the radio keeps its packet id."""
         task = asyncio.current_task()
         if task not in self._turn_tasks or result.success:
             return result
         raw = getattr(result, "raw_response", None)
+        if isinstance(raw, dict) and raw.get("may_have_reached") is True:
+            return result
         sent = raw.get("chunks_sent") if isinstance(raw, dict) else 0
         if isinstance(sent, int) and not isinstance(sent, bool) and sent > 0:
             return result
