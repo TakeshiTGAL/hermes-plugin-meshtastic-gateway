@@ -20,7 +20,7 @@ SEND_QUEUE_SECONDS = 12
 
 
 class RadioNotSent(Exception):
-    """sendText was not called. The radio queue had no free slot in time."""
+    """The chunk was not written, and it is not left in the library queue."""
 
 
 def _open_tcp(spec: dict) -> Any:
@@ -92,10 +92,24 @@ def _tx_slot_is_free(iface: Any) -> bool | None:
     return free > 0
 
 
+def _drop_keys_added(iface: Any, before: set | None) -> None:
+    """Drop packets this attempt queued, so a later send cannot flush them."""
+    queue = getattr(iface, "queue", None)
+    if before is None or not hasattr(queue, "keys") or not hasattr(queue, "pop"):
+        return
+    for key in list(queue.keys()):
+        if key not in before:
+            queue.pop(key, None)
+
+
 def send_text(iface: Any, node: str, text: str) -> str:
     """One unreliable text. wantAck stays false so this call does not ask for retries.
 
-    A full transmit queue raises RadioNotSent before sendText. The socket was not written.
+    A full queue raises RadioNotSent. The wait before sendText is at most
+    SEND_QUEUE_SECONDS. Inside sendText the library sleeps 0.5 seconds forever
+    while its queue reports no free slot, after it has already stored the
+    packet. A no-slot result stops that wait and drops the stored packet.
+    The socket was not written.
     """
     deadline = time.monotonic() + SEND_QUEUE_SECONDS
     while True:
@@ -105,7 +119,36 @@ def send_text(iface: Any, node: str, text: str) -> str:
         if slot is None or time.monotonic() >= deadline:
             raise RadioNotSent("The radio queue is full. Nothing was sent.")
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-    packet = iface.sendText(text, destinationId=node, wantAck=False)
+    queue = getattr(iface, "queue", None)
+    before = set(queue) if hasattr(queue, "keys") else None
+    original = getattr(iface, "_queueHasFreeSpace", None)
+    if not callable(original):
+        packet = iface.sendText(text, destinationId=node, wantAck=False)
+    else:
+        seen: list = []
+
+        def _stop_when_full() -> bool:
+            # Returning false makes the library sleep until a slot appears.
+            live = getattr(iface, "queue", None)
+            if before is not None and hasattr(live, "keys"):
+                for key in list(live.keys()):
+                    if key not in before and key not in seen:
+                        seen.append(key)
+            if original():
+                return True
+            still_here = bool(seen) and hasattr(live, "__contains__") and all(key in live for key in seen)
+            if still_here or not seen:
+                raise RadioNotSent("The radio queue is full. Nothing was sent.")
+            raise RuntimeError("The radio queue stalled after a chunk left the library queue.")
+
+        iface._queueHasFreeSpace = _stop_when_full
+        try:
+            packet = iface.sendText(text, destinationId=node, wantAck=False)
+        except RadioNotSent:
+            _drop_keys_added(iface, before)
+            raise
+        finally:
+            iface._queueHasFreeSpace = original
     packet_id = getattr(packet, "id", None)
     if packet_id is None and isinstance(packet, dict):
         packet_id = packet.get("id")

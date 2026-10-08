@@ -1378,6 +1378,101 @@ def test_a_full_transmit_queue_does_not_call_send_text(monkeypatch):
     assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_line("echo hi", "list", 200)]
 
 
+def test_a_queue_that_fills_during_send_text_is_not_written(monkeypatch):
+    """The library stores the packet, then sleeps while free == 0. Stop that."""
+    import radio
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+
+    class _Race:
+        def __init__(self):
+            self.written = []
+            self.queue = {7: "already"}
+            self.calls = 0
+            self.sleeps = 0
+            self.block = True
+            self._reads = 0
+            self.queueStatus = self
+
+        @property
+        def free(self):
+            self._reads += 1
+            if not self.block:
+                return 4
+            return 4 if self._reads < 2 else 0
+
+        def _queueHasFreeSpace(self):
+            return self.free > 0
+
+        def sendText(self, text, destinationId, wantAck=False):
+            self.calls += 1
+            self.queue[1000 + self.calls] = text
+            while self.queue:
+                while not self._queueHasFreeSpace():
+                    self.sleeps += 1
+                    if self.sleeps > 3:
+                        raise TimeoutError("library wait was not bounded")
+                    time.sleep(0.05)
+                key = next(iter(self.queue))
+                packet = self.queue.pop(key)
+                if isinstance(packet, str) and packet != "already":
+                    self.written.append(packet)
+            return {"id": self.calls}
+
+    iface = _Race()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+    line = adapter.radio_approval_line("echo hi", "list", 200)
+
+    def _prompt():
+        return ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-race",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        )
+
+    async def handler(_event):
+        _hold_pending("s-race", "echo hi")
+        try:
+            started = time.monotonic()
+            box["race"] = await created._send_exec_approval_prompt(_prompt())
+            box["elapsed"] = time.monotonic() - started
+            box["queue_after_race"] = dict(iface.queue)
+            box["method_restored"] = iface._queueHasFreeSpace.__func__ is _Race._queueHasFreeSpace
+            iface.block = False
+            box["later"] = await created._send_exec_approval_prompt(_prompt())
+        finally:
+            _clear_pending("s-race")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "race1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["race"].success is False and declined_send(box["race"]) is True
+    assert box["race"].error == "The radio queue is full. Nothing was sent."
+    assert not (isinstance(box["race"].raw_response, dict) and box["race"].raw_response.get("may_have_reached"))
+    assert box["elapsed"] < 0.4
+    assert iface.sleeps == 0
+    assert iface.calls == 2
+    assert 7 in box["queue_after_race"]
+    assert line not in box["queue_after_race"].values()
+    assert box["method_restored"] is True
+    assert iface.written == [line]
+    assert box["later"].success is True
+
+
 def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     from gateway.relay.egress import declined_send

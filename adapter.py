@@ -665,7 +665,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # Off the event loop: the library can block while the link is down.
                 packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
             except RadioNotSent:
-                # sendText was not called. This chunk is not on the radio.
+                # The chunk was not written and is not left in the library queue.
                 note = (
                     f"Sent {len(sent)} of {len(chunks)}. The radio queue is full. This chunk was not sent."
                     if sent
