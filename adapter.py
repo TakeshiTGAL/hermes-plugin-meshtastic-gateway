@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import re
 import time
 from typing import Any
 
@@ -143,14 +144,34 @@ def _approval_scope_phrases() -> tuple[str, ...] | None:
     return tuple(words)
 
 
+# Hermes mask_secret keeps 6 characters, writes three dots, then keeps 4.
+# Short secrets become "***", private keys "[REDACTED ...]", vault values "«redacted...".
+_MASKED_TOKEN = re.compile(r"\S{6}\.\.\.\S{4}")
+_REDACTION_MARKS = ("***", "[REDACTED", "[redacted]", "«redacted")
+
+
+def _command_is_masked(command: str) -> bool:
+    """True when Hermes has replaced a secret and will still run the original.
+
+    The pending queue stores that masked copy, so a match against the queue is
+    not proof that /approve runs this text.
+    """
+    if any(mark in command for mark in _REDACTION_MARKS):
+        return True
+    return _MASKED_TOKEN.search(command) is not None
+
+
 def _approve_will_run(session_key: object, command: object) -> bool:
     """True when the next /approve for this session runs exactly `command`.
 
-    Hermes redacts the command before it builds the prompt, and /approve runs
-    the oldest pending command, which is the original. A missing reader, an
-    empty session, or any other string means the radio must not show a line.
+    The queue holds the text Hermes shows. A masked command is not that text's
+    original, so it is not sent even when the queue matches it. A missing
+    reader, an empty session, or any other string means the radio must not
+    show a line.
     """
     if not isinstance(session_key, str) or session_key == "" or not isinstance(command, str):
+        return False
+    if _command_is_masked(command):
         return False
     try:
         from tools.approval import get_pending_gateway_approval
@@ -159,7 +180,10 @@ def _approve_will_run(session_key: object, command: object) -> bool:
         return False
     if not isinstance(pending, dict):
         return False
-    return pending.get("command") == command
+    pending_command = pending.get("command")
+    if not isinstance(pending_command, str) or _command_is_masked(pending_command):
+        return False
+    return pending_command == command
 
 
 def _undelivered_approval(result: SendResult) -> SendResult:

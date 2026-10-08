@@ -32,7 +32,7 @@ def _warn_corrupt_once() -> None:
         return
     _corrupt_warned = True
     logging.getLogger(__name__).warning(
-        "nodes.json could not be read. It was left unchanged, and new rows are not recorded until you delete it."
+        "nodes.json could not be read as a list of rows. It was left unchanged, and new rows are not recorded until you delete it."
     )
 
 
@@ -48,11 +48,13 @@ def remember(node: str, direction: str, nbytes: int, now: float) -> None:
             if path.exists():
                 try:
                     loaded = json.loads(path.read_text(encoding="utf-8"))
-                    if isinstance(loaded, list):
-                        rows = loaded
                 except (OSError, json.JSONDecodeError):
                     _warn_corrupt_once()
                     return
+                if not isinstance(loaded, list):
+                    _warn_corrupt_once()
+                    return
+                rows = loaded
             rows.append({
                 "node": node,
                 "direction": direction,

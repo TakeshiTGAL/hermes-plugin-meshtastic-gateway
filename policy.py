@@ -472,8 +472,10 @@ def radio_approval_line(command: object, description: object, chunk: int) -> str
     """One radio line from the structured command and description, or None.
 
     None means do not transmit. The command inside a returned line is exactly
-    `command`, which is what `/approve` runs. A line break, a format character,
-    a backtick fence, or a line that would have to be cut returns None.
+    `command`. The caller refuses a masked command, and a command that is not
+    the one `/approve` runs, before it asks for this line. A line break, a
+    format character, a backtick fence, or a line that would have to be cut
+    returns None.
     The long prompt text is not read.
     """
     if not isinstance(command, str) or not isinstance(description, str) or command == "":

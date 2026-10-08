@@ -163,6 +163,11 @@ def test_remember_replaces_a_temp_file(tmp_path, monkeypatch, caplog):
         store.remember("!aabbccdd", "out", 1, 3.0)
     assert path.read_text(encoding="utf-8") == "{"
     assert caplog.text.count("could not be read") == 1
+    path.write_text('{"kept": true}', encoding="utf-8")
+    store._corrupt_warned = False
+    with caplog.at_level("WARNING"):
+        store.remember("!aabbccdd", "out", 1, 4.0)
+    assert path.read_text(encoding="utf-8") == '{"kept": true}'
 
 
 def test_serial_and_ble_are_refused_before_the_library():

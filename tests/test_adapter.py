@@ -1309,6 +1309,29 @@ def test_a_redacted_command_is_not_transmitted(monkeypatch):
             smart_denied=False,
         ))
         _clear_pending("s-redact")
+        # Current Hermes stores the masked copy. Matching that copy must still not air.
+        _hold_pending("s-mask", shown)
+        box["masked_queue"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-mask",
+            text=shown,
+            actions=[("Allow Once", "once", "primary")],
+            command=shown,
+            description="delete in root path",
+            smart_denied=False,
+        ))
+        _clear_pending("s-mask")
+        _hold_pending("s-stars", "echo ***")
+        box["stars"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-stars",
+            text="echo ***",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo ***",
+            description="list",
+            smart_denied=False,
+        ))
+        _clear_pending("s-stars")
         # An older different command is what /approve would run. Do not air the newer one.
         _hold_pending("s-order", "echo first")
         _hold_pending("s-order", "echo second")
@@ -1340,6 +1363,8 @@ def test_a_redacted_command_is_not_transmitted(monkeypatch):
 
     asyncio.run(run())
     assert box["redacted"].success is False and declined_send(box["redacted"]) is True
+    assert box["masked_queue"].success is False and declined_send(box["masked_queue"]) is True
+    assert box["stars"].success is False and declined_send(box["stars"]) is True
     assert box["newer"].success is False and declined_send(box["newer"]) is True
     assert box["oldest"].success is True
     aired = [text for _dest, text, _ack in iface.sent]
