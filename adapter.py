@@ -28,6 +28,7 @@ if __package__:
         plaintext_restart,
         radio_approval_text,
         radio_command_refusal,
+        session_reset_command,
         short_unscoped_reply,
         slash_confirm_line,
         widens_approval,
@@ -60,6 +61,7 @@ else:
         plaintext_restart,
         radio_approval_text,
         radio_command_refusal,
+        session_reset_command,
         short_unscoped_reply,
         slash_confirm_line,
         widens_approval,
@@ -89,6 +91,7 @@ COMMAND_REFUSAL = (
     "Over the radio, only these commands are accepted: /approve (once only), /deny, /cancel, /stop, "
     "/new, /reset, /help, /status, /whoami, /retry, /undo."
 )
+BUSY_RESET_REFUSAL = "Turn still running. /new and /reset refused. Session not reset."
 
 
 def _text_as_hermes_reads_it(event: MessageEvent, text: str) -> str:
@@ -448,17 +451,22 @@ class MeshtasticAdapter(BasePlatformAdapter):
         task = asyncio.current_task()
         if task is not None:
             self._send_tasks.add(task)
+        # Hermes resets /new and /reset without asking when a turn is already running.
+        already_busy = self._turn_nodes.get(item["node"], 0) > 0
         self._hold_turn_node(item["node"])
         radio = _from_radio.set(True)
         try:
             refusal = None
-            kind = radio_command_refusal(_text_as_hermes_reads_it(event, item["text"]))
+            seen = _text_as_hermes_reads_it(event, item["text"])
+            kind = radio_command_refusal(seen)
             if kind == "approve":
                 # Hermes would keep a session or always approval. A radio node may approve once only.
                 refusal = APPROVAL_SCOPE_REFUSAL
             elif kind == "command":
                 # /yolo, /approvals and the rest can change approval for the session or the whole profile.
                 refusal = COMMAND_REFUSAL
+            elif already_busy and session_reset_command(seen):
+                refusal = BUSY_RESET_REFUSAL
             else:
                 phrases = _approval_scope_phrases()
                 if phrases is None and short_unscoped_reply(item["text"]):

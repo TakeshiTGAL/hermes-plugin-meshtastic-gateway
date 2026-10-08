@@ -213,6 +213,15 @@ def test_radio_commands_are_an_allowlist():
     assert policy.slash_confirm_line("/undo", "the last 3 user turns") == (
         "/undo drops 3 turns. /approve or /cancel. always refused."
     )
+    assert policy.slash_confirm_line("/undo", "session 20261008 removes the last 2 turns") == (
+        "/undo drops 2 turns. /approve or /cancel. always refused."
+    )
+    assert policy.session_reset_command("/new") is True
+    assert policy.session_reset_command("/reset name") is True
+    assert policy.session_reset_command("!new@bot") is True
+    assert policy.session_reset_command("/undo") is False
+    assert policy.session_reset_command("hello") is False
+    assert len(b"Turn still running. /new and /reset refused. Session not reset.") <= 64
     for line in (
         policy.slash_confirm_line("/new", ""),
         policy.slash_confirm_line("/reset", ""),

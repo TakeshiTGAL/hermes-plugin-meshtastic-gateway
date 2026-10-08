@@ -984,6 +984,51 @@ def test_interim_text_during_the_turn_is_refused_and_the_final_reply_is_sent(mon
     assert created._seen == ["replay-2"]
 
 
+def test_new_during_a_running_turn_does_not_reset(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    handed = []
+    release = asyncio.Event()
+
+    async def handler(event):
+        handed.append(event.text)
+        if event.text == "go":
+            await release.wait()
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        first = asyncio.create_task(created._accept({
+            "node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "busy-1",
+        }))
+        for _ in range(50):
+            if handed == ["go"]:
+                break
+            await asyncio.sleep(0)
+        await created._accept({
+            "node": "!aabbccdd", "text": "/new", "channel": False, "packet_id": "busy-2",
+        })
+        await created._accept({
+            "node": "!aabbccdd", "text": "/reset later", "channel": False, "packet_id": "busy-3",
+        })
+        await created._accept({
+            "node": "!aabbccdd", "text": "/stop", "channel": False, "packet_id": "busy-4",
+        })
+        release.set()
+        await first
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert "/new" not in handed
+    assert "/reset later" not in handed
+    assert handed == ["go", "/stop"]
+    assert [text for _dest, text, _ack in iface.sent].count(adapter.BUSY_RESET_REFUSAL) == 2
+
+
 def test_an_unsent_exec_approval_is_declined_so_hermes_drops_it(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     from gateway.platforms.base import ExecApprovalPrompt

@@ -346,12 +346,9 @@ def slash_confirm_line(title: object, message: object = "") -> str:
     if name in {"/new", "/reset"}:
         effect = "discards history"
     elif name == "/undo":
-        count = 1
-        for raw in re.findall(r"\d+", str(message or "")):
-            number = int(raw)
-            if number > 1:
-                count = number
-                break
+        # The last integer above 1. A date earlier in the prompt must not become the count.
+        counts = [int(raw) for raw in re.findall(r"\d+", str(message or "")) if int(raw) > 1]
+        count = counts[-1] if counts else 1
         effect = "drops last exchange" if count == 1 else f"drops {count} turns"
     else:
         effect = "changes this session"
@@ -423,6 +420,24 @@ def radio_command_refusal(text: object) -> str | None:
     if name in RADIO_COMMANDS:
         return None
     return "command"
+
+
+def session_reset_command(text: object) -> bool:
+    """True for /new and /reset, including a ! prefix and an @bot suffix.
+
+    Hermes treats /reset as another name for /new. While a turn is running it
+    resets the session without asking, so the adapter refuses both names then.
+    """
+    body = _ATTACHMENT_REFS.sub("", str(text or "").lstrip()).lstrip()
+    if not body or body[0] not in "/!":
+        return False
+    words = body[1:].split()
+    if not words:
+        return False
+    name = words[0].lower().split("@", 1)[0]
+    if body[0] == "/" and "/" in name:
+        return False
+    return name in {"new", "reset"}
 
 
 APPROVAL_PREFIX = "Reply /approve or /deny (once only). "
