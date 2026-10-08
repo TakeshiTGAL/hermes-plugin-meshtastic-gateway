@@ -336,6 +336,16 @@ WIDE_APPROVAL_PHRASES = frozenset({
 _ATTACHMENT_REFS = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
 
 
+def short_unscoped_reply(text: object) -> bool:
+    """True when the text is short enough to be one always or session word.
+
+    Used only when Hermes' own word list cannot be read. A longer reply cannot be
+    exactly one of those words, so it is not refused for this reason.
+    """
+    body = " ".join(str(text or "").split())
+    return bool(body) and len(body) <= 40
+
+
 def widens_approval(text: object, extra_phrases: object = ()) -> bool:
     """True when the text would approve for the session or permanently, not just once.
 
@@ -365,7 +375,8 @@ def widens_approval(text: object, extra_phrases: object = ()) -> bool:
 # Slash commands a radio node may send. Each exists in Hermes v0.21.4 and main.
 # The rest are refused before Hermes sees them: /yolo skips approval for the session,
 # /approvals changes approval for the whole profile.
-RADIO_COMMANDS = ("approve", "deny", "stop", "new", "reset", "help", "status", "whoami", "retry", "undo")
+# /cancel is Hermes' own word for leaving a /new, /reset, or /undo confirmation unchanged.
+RADIO_COMMANDS = ("approve", "deny", "cancel", "stop", "new", "reset", "help", "status", "whoami", "retry", "undo")
 
 
 def radio_command_refusal(text: object) -> str | None:

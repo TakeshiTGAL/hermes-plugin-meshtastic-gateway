@@ -28,6 +28,7 @@ if __package__:
         plaintext_restart,
         radio_approval_text,
         radio_command_refusal,
+        short_unscoped_reply,
         widens_approval,
     )
     from .radio import (
@@ -58,6 +59,7 @@ else:
         plaintext_restart,
         radio_approval_text,
         radio_command_refusal,
+        short_unscoped_reply,
         widens_approval,
     )
     from radio import (
@@ -82,7 +84,7 @@ APPROVAL_SCOPE_REFUSAL = (
 )
 APPROVAL_WORD_REFUSAL = APPROVAL_SCOPE_REFUSAL + " To send the word itself, add more words."
 COMMAND_REFUSAL = (
-    "Over the radio, only these commands are accepted: /approve (once only), /deny, /stop, "
+    "Over the radio, only these commands are accepted: /approve (once only), /deny, /cancel, /stop, "
     "/new, /reset, /help, /status, /whoami, /retry, /undo."
 )
 
@@ -103,19 +105,54 @@ def _text_as_hermes_reads_it(event: MessageEvent, text: str) -> str:
     return getattr(event, "text", None) or text
 
 
-def _approval_scope_phrases() -> tuple[str, ...]:
-    """Hermes' own words for session and always approval, in the active language, when Hermes exposes them."""
+def _approval_scope_phrases() -> tuple[str, ...] | None:
+    """Hermes' own words for session and always approval, in the active language.
+
+    () when this Hermes has no such list (v0.21.4 matches the English constants only).
+    None when the list exists but cannot be read. The caller then refuses a short reply
+    instead of treating the failure as "no extra words".
+    """
     try:
-        from gateway.run_busy import approval_input_words
+        from gateway import run_busy
     except Exception:
+        return None
+    reader = getattr(run_busy, "approval_input_words", None)
+    if reader is None:
         return ()
     words: list[str] = []
-    for key in ("always", "session", "confirm_always"):
-        try:
-            words.extend(approval_input_words(key))
-        except Exception:
-            continue
+    try:
+        for key in ("always", "session", "confirm_always"):
+            words.extend(reader(key))
+    except Exception:
+        return None
     return tuple(words)
+
+
+def _undelivered_approval(result: SendResult) -> SendResult:
+    """Turn a failed approval send into the result Hermes uses to drop the queue.
+
+    A success=False return on the plain-text path leaves the approval pending, so
+    /approve can still run a command the radio never showed. The button path treats
+    code egress_declined as undeliverable and does not send the question again.
+    A chunk that may already be on the air is ambiguous, so Hermes does not resend it.
+    """
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict) and raw.get("may_have_reached") is True:
+        merged = dict(raw)
+        merged["ambiguous"] = True
+        return SendResult(
+            success=False,
+            error=result.error,
+            message_id=result.message_id,
+            retryable=False,
+            raw_response=merged,
+        )
+    return SendResult(
+        success=False,
+        error=result.error or "The approval question was not sent.",
+        retryable=False,
+        raw_response={"code": "egress_declined"},
+    )
 
 
 def _env(config: PlatformConfig, name: str) -> str:
@@ -235,7 +272,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
         task = asyncio.current_task()
         if task is None or task not in self._in_handler:
             return False
-        return (metadata or {}).get("is_approval_prompt") is not True
+        meta = metadata or {}
+        if meta.get("is_approval_prompt") is True or meta.get("radio_confirm") is True:
+            return False
+        return True
 
     def _hold_turn_node(self, node: str) -> None:
         if node:
@@ -417,8 +457,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
             elif kind == "command":
                 # /yolo, /approvals and the rest can change approval for the session or the whole profile.
                 refusal = COMMAND_REFUSAL
-            elif widens_approval(item["text"], _approval_scope_phrases()):
-                refusal = APPROVAL_WORD_REFUSAL
+            else:
+                phrases = _approval_scope_phrases()
+                if phrases is None and short_unscoped_reply(item["text"]):
+                    # The localized word list exists but could not be read. A short reply
+                    # might be one of those words, so it is not handed to Hermes.
+                    refusal = APPROVAL_WORD_REFUSAL
+                elif widens_approval(item["text"], phrases or ()):
+                    refusal = APPROVAL_WORD_REFUSAL
             if refusal is not None:
                 await self.send(item["node"], refusal)
                 return
@@ -459,13 +505,23 @@ class MeshtasticAdapter(BasePlatformAdapter):
             )
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
         limit = max_chunks(_env(self.config, "MESHTASTIC_MAX_CHUNKS") or 4)
-        approval = (metadata or {}).get("is_approval_prompt") is True
-        if approval:
+        meta = metadata or {}
+        approval = meta.get("is_approval_prompt") is True
+        confirm = meta.get("radio_confirm") is True
+        if confirm and not approval:
+            chunks, cut = chunk_text(content or "", size, 1)
+            if cut or not chunks:
+                return SendResult(
+                    success=False,
+                    retryable=False,
+                    error="confirmation does not fit one radio chunk",
+                )
+        elif approval:
             # One short chunk: the long Hermes question would need several gaps, and only once is accepted here.
             chunks, cut = chunk_text(radio_approval_text(content), size, 1)
             if cut:
-                # Nobody may approve a command they could not read in full. Hermes then fails closed
-                # (notify_failed or the approval timeout).
+                # Nobody may approve a command they could not read in full.
+                # _send_exec_approval_prompt turns this into a decline so Hermes drops the queue.
                 return SendResult(
                     success=False,
                     retryable=False,
@@ -577,6 +633,53 @@ class MeshtasticAdapter(BasePlatformAdapter):
         elif cut:
             note = "The reply was cut. The chunk size is too small to carry [cut], so the last chunk has no mark."
         return SendResult(success=True, message_id=sent[-1] if sent else "", error=note, retryable=False)
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Send one approval question as text, on Hermes' button path.
+
+        Overriding this method makes Hermes call it instead of the plain-text
+        notify path. A decline drops the pending approval. success=False on the
+        plain-text path would leave /approve able to run the unseen command.
+        """
+        meta = dict(getattr(prompt, "metadata", None) or {})
+        meta["is_approval_prompt"] = True
+        result = await self.send(getattr(prompt, "chat_id", ""), getattr(prompt, "text", "") or "", metadata=meta)
+        if result.success:
+            return result
+        return _undelivered_approval(result)
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: dict | None = None,
+    ) -> SendResult:
+        """Replace Hermes' /new confirmation. always is not offered. /cancel is.
+
+        A decline makes Hermes drop the pending confirmation and not send the
+        long prompt, which names /always and is cut when the chunk is small.
+        """
+        text = f"Confirm {title}. /approve once or /cancel. always refused."
+        stamped = dict(metadata or {})
+        stamped["radio_confirm"] = True
+        size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
+        _chunks, cut = chunk_text(text, size, 1)
+        if cut:
+            note = "Confirmation does not fit. Command not run."
+            await self.send(chat_id, note, metadata=stamped)
+            return SendResult(
+                success=False,
+                retryable=False,
+                error="confirmation does not fit one radio chunk",
+                raw_response={"code": "egress_declined"},
+            )
+        result = await self.send(chat_id, text, metadata=stamped)
+        if result.success:
+            return result
+        return _undelivered_approval(result)
 
 
 def check_requirements() -> bool:

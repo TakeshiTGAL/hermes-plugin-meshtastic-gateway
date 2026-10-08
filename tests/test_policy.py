@@ -201,9 +201,12 @@ def test_radio_commands_are_an_allowlist():
         assert policy.radio_command_refusal(text) == "command", text
     for text in ("/approve always", "/approve session", "/approve all"):
         assert policy.radio_command_refusal(text) == "approve", text
-    for text in ("/approve", "/approve once", "/deny", "/stop", "/new", "/reset", "/help", "/STATUS@bot",
+    for text in ("/approve", "/approve once", "/deny", "/cancel", "/stop", "/new", "/reset", "/help", "/STATUS@bot",
                  "/whoami", "/retry", "/undo", "hello", "/home/me/file is broken", ""):
         assert policy.radio_command_refusal(text) is None, text
+    assert policy.short_unscoped_reply("hello-from-radio") is True
+    assert policy.short_unscoped_reply("x" * 41) is False
+    assert policy.short_unscoped_reply("") is False
 
 
 def test_approval_question_is_made_short():

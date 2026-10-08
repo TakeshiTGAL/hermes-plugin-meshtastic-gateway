@@ -612,7 +612,7 @@ def test_radio_commands_outside_the_list_never_reach_hermes(monkeypatch):
         return None
 
     refused = ["/yolo", "/approvals off", "/APPROVALS OFF", "!yolo", "/yolo@bot"]
-    passed = ["/status", "/help@bot", "/deny not now", "/approve once", "hello there"]
+    passed = ["/status", "/help@bot", "/deny not now", "/approve once", "/cancel", "hello there"]
 
     async def run():
         created.set_message_handler(handler)
@@ -982,3 +982,126 @@ def test_interim_text_during_the_turn_is_refused_and_the_final_reply_is_sent(mon
     ]
     assert "sethome" not in " ".join(text for _dest, text, _ack in iface.sent)
     assert created._seen == ["replay-2"]
+
+
+def test_an_unsent_exec_approval_is_declined_so_hermes_drops_it(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        long_prompt = ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s",
+            text="x" * 500,
+            actions=[("Allow Once", "once", "primary")],
+            command="x" * 400,
+            description="long",
+            smart_denied=False,
+        )
+        box["long"] = await created._send_exec_approval_prompt(long_prompt)
+        short_prompt = ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        )
+        box["short"] = await created._send_exec_approval_prompt(short_prompt)
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "ea1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["long"].success is False
+    assert declined_send(box["long"]) is True
+    assert box["short"].success is True
+    assert declined_send(box["short"]) is False
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert sent == [adapter.radio_approval_text("echo hi")]
+    assert "x" * 50 not in sent[0]
+
+
+def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.relay.egress import declined_send
+
+    _register()
+    cfg = _config()
+    cfg.extra["MESHTASTIC_CHUNK_BYTES"] = "64"
+    created = platform_registry.create_adapter("radio-dm-gateway", cfg)
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        box["fit"] = await created.send_slash_confirm(
+            "!aabbccdd", "/new", "⚠️ **Confirm /new**\n\nAlways Approve\n/cancel", "s", "1",
+        )
+        box["cut"] = await created.send_slash_confirm(
+            "!aabbccdd", "/" + ("n" * 80), "long title", "s", "2",
+        )
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "sc1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["fit"].success is True
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert sent[0] == "Confirm /new. /approve once or /cancel. always refused."
+    assert "Always Approve" not in " ".join(sent)
+    assert box["cut"].success is False
+    assert declined_send(box["cut"]) is True
+    assert sent[-1] == "Confirmation does not fit. Command not run."
+
+
+def test_unreadable_approval_words_refuse_a_short_reply(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+
+    def boom(_key):
+        raise RuntimeError("word list down")
+
+    import gateway.run_busy as run_busy
+    monkeypatch.setattr(run_busy, "approval_input_words", boom, raising=False)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    handed = []
+
+    async def handler(event):
+        handed.append(event.text)
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "hello", "channel": False, "packet_id": "w1"})
+        await _finish_turns(created)
+        await created._accept({
+            "node": "!aabbccdd",
+            "text": "this reply is longer than forty characters easily",
+            "channel": False,
+            "packet_id": "w2",
+        })
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert handed == ["this reply is longer than forty characters easily"]
+    assert [text for _dest, text, _ack in iface.sent] == [adapter.APPROVAL_WORD_REFUSAL]
