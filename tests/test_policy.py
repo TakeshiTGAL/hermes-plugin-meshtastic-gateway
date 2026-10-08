@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unicodedata
+
 import policy
 from policy import (
     SendBudget,
@@ -261,6 +263,24 @@ def test_approval_line_is_the_command_and_a_fence_is_refused():
     assert policy.radio_approval_line("echo hi", "y" * 300, 200) is None
     assert policy.radio_approval_line("", "reason", 200) is None
     assert policy.radio_approval_line(None, "reason", 200) is None
+    # One split line can still hide a break or a bidi override.
+    for broken in (
+        "echo hi\u2028there",
+        "echo hi\u2029there",
+        "echo hi\u202ethere",
+        "echo hi\u000cthere",
+        "echo hi\tthere",
+        "echo hi\n",
+        "echo hi\r",
+    ):
+        assert policy.radio_approval_line(broken, "reason", 200) is None, repr(broken)
+        assert len(broken.splitlines()) != 1 or any(
+            unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in broken
+        )
+    assert policy.radio_approval_line("echo hi", "reason\u2028more", 200) is None
+    assert policy.radio_approval_line("echo hi", "reason\u202e", 200) is None
+    assert policy.radio_text_is_one_line("echo hi") is True
+    assert policy.radio_text_is_one_line("") is False
 
 
 def test_plain_text_restart_phrases_are_read_as_restart():

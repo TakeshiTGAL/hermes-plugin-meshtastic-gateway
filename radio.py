@@ -102,16 +102,19 @@ def _drop_keys_added(iface: Any, before: set | None) -> None:
             queue.pop(key, None)
 
 
-def send_text(iface: Any, node: str, text: str) -> str:
+def send_text(iface: Any, node: str, text: str, *, queue_wait: float | None = None) -> str:
     """One unreliable text. wantAck stays false so this call does not ask for retries.
 
     A full queue raises RadioNotSent. The wait before sendText is at most
-    SEND_QUEUE_SECONDS. Inside sendText the library sleeps 0.5 seconds forever
-    while its queue reports no free slot, after it has already stored the
-    packet. A no-slot result stops that wait and drops the stored packet.
-    The socket was not written.
+    SEND_QUEUE_SECONDS, or `queue_wait` when the caller passes one. An approval
+    passes the time still left in its 12 second budget, so the gap and this
+    wait together stay inside the 15 seconds Hermes watches. Inside sendText
+    the library sleeps 0.5 seconds forever while its queue reports no free
+    slot, after it has already stored the packet. A no-slot result stops that
+    wait and drops the stored packet. The socket was not written.
     """
-    deadline = time.monotonic() + SEND_QUEUE_SECONDS
+    budget = SEND_QUEUE_SECONDS if queue_wait is None else max(0.0, queue_wait)
+    deadline = time.monotonic() + budget
     while True:
         slot = _tx_slot_is_free(iface)
         if slot is True:

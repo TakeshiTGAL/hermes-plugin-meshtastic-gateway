@@ -28,6 +28,7 @@ if __package__:
         plaintext_restart,
         radio_approval_line,
         radio_command_refusal,
+        radio_text_is_one_line,
         session_reset_command,
         short_unscoped_reply,
         slash_confirm_line,
@@ -67,6 +68,7 @@ else:
         plaintext_restart,
         radio_approval_line,
         radio_command_refusal,
+        radio_text_is_one_line,
         session_reset_command,
         short_unscoped_reply,
         slash_confirm_line,
@@ -566,9 +568,10 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 )
         elif approval:
             # The line was built from the command. Do not parse it, and do not cut it.
-            # A fence or a newline here is the long prompt, not the command that will run.
+            # A fence, a line break, or a format character here is not the one line
+            # /approve will run.
             body = content or ""
-            if "\n" in body or "\r" in body or "```" in body:
+            if not radio_text_is_one_line(body):
                 return SendResult(
                     success=False,
                     retryable=False,
@@ -663,7 +666,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 ))
             try:
                 # Off the event loop: the library can block while the link is down.
-                packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
+                # An approval shares one 12 second budget with the gap above.
+                # Hermes stops watching at 15 seconds and keeps the approval if
+                # this call is still running, so the queue wait is only the remainder.
+                if approval:
+                    remain = APPROVAL_SEND_SECONDS - (time.monotonic() - started)
+                    packet_id = await asyncio.to_thread(
+                        send_text, iface, dest, chunk, queue_wait=max(0.0, remain)
+                    )
+                else:
+                    packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
             except RadioNotSent:
                 # The chunk was not written and is not left in the library queue.
                 note = (
@@ -706,10 +718,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         """Send one approval question as text, on Hermes' button path.
 
         The radio line is the structured command and description. The long prompt
-        text is not parsed. A newline, a backtick fence, a command that does not
-        fit one chunk, a command that is not the one /approve will run, or a
-        Hermes build with no command field is not transmitted. A decline drops
-        the pending approval, so /approve cannot run it.
+        text is not parsed. A line break, a format character, a backtick fence,
+        a command that does not fit one chunk, a command that is not the one
+        /approve will run, or a Hermes build with no command field is not
+        transmitted. The gap and a full queue share one 12 second budget, so
+        the decline returns before Hermes stops watching at 15 seconds. A
+        decline drops the pending approval, so /approve cannot run it.
         """
         meta = dict(getattr(prompt, "metadata", None) or {})
         meta["is_approval_prompt"] = True

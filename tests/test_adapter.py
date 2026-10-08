@@ -1226,6 +1226,60 @@ def test_a_command_that_contains_a_fence_is_not_transmitted(monkeypatch):
     assert iface.sent == []
 
 
+def test_a_unicode_line_break_or_bidi_override_is_not_transmitted(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+    cases = {
+        "line": "echo hi\u2028there",
+        "para": "echo hi\u2029there",
+        "bidi": "echo hi\u202ethere",
+    }
+
+    async def handler(_event):
+        for key, command in cases.items():
+            _hold_pending(f"s-{key}", command)
+            box[key] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+                chat_id="!aabbccdd",
+                session_key=f"s-{key}",
+                text=command,
+                actions=[("Allow Once", "once", "primary")],
+                command=command,
+                description="list",
+                smart_denied=False,
+            ))
+            _clear_pending(f"s-{key}")
+        _hold_pending("s-reason", "echo hi")
+        box["reason"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-reason",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="why\u202ethere",
+            smart_denied=False,
+        ))
+        _clear_pending("s-reason")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "uni1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    for key in ("line", "para", "bidi", "reason"):
+        assert box[key].success is False and declined_send(box[key]) is True, key
+    assert iface.sent == []
+
+
 def test_a_redacted_command_is_not_transmitted(monkeypatch):
     """Hermes shows a redacted copy. /approve runs the original. Those must not be aired apart."""
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
@@ -1337,6 +1391,7 @@ def test_a_full_transmit_queue_does_not_call_send_text(monkeypatch):
     from gateway.relay.egress import declined_send
 
     monkeypatch.setattr(radio, "SEND_QUEUE_SECONDS", 0.05)
+    monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.05)
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     _register()
     created = platform_registry.create_adapter("radio-dm-gateway", _config())
@@ -1376,6 +1431,62 @@ def test_a_full_transmit_queue_does_not_call_send_text(monkeypatch):
     assert not (isinstance(box["full"].raw_response, dict) and box["full"].raw_response.get("may_have_reached"))
     assert box["free"].success is True
     assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_line("echo hi", "list", 200)]
+
+
+def test_an_approval_queue_wait_stays_inside_the_gap_budget(monkeypatch):
+    """The gap and a full queue share 12 seconds. They must not stack past Hermes's 15."""
+    import radio
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.45)
+    # The old bug added this whole wait after the gap and outran Hermes.
+    monkeypatch.setattr(radio, "SEND_QUEUE_SECONDS", 5.0)
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    iface.queueStatus = type("Queue", (), {"free": 0})()
+    created._iface = iface
+
+    class _Gap:
+        def plan(self, _count, _now):
+            return None, 0.25
+
+        def mark(self, _now):
+            return None
+
+    created._budget = _Gap()
+    box = {}
+
+    async def handler(_event):
+        _hold_pending("s-budget", "echo hi")
+        started = time.monotonic()
+        box["result"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-budget",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        ))
+        box["elapsed"] = time.monotonic() - started
+        _clear_pending("s-budget")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "bud1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["result"].success is False and declined_send(box["result"]) is True
+    assert box["result"].error == "The radio queue is full. Nothing was sent."
+    assert not (isinstance(box["result"].raw_response, dict) and box["result"].raw_response.get("may_have_reached"))
+    assert box["elapsed"] > 0.25
+    assert box["elapsed"] < 0.9
+    assert iface.sent == []
 
 
 def test_a_queue_that_fills_during_send_text_is_not_written(monkeypatch):

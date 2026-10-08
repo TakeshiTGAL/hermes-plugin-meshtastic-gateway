@@ -7,6 +7,7 @@ is under the Meshtastic® DATA_PAYLOAD_LEN of 233.
 from __future__ import annotations
 
 import re
+import unicodedata
 from urllib.parse import urlparse
 
 BROADCAST = 0xFFFFFFFF
@@ -449,20 +450,37 @@ def session_reset_command(text: object) -> bool:
 
 
 APPROVAL_PREFIX = "Reply /approve or /deny (once only). "
+# Cc control, Cf format (includes U+202E), Zl/Zp line and paragraph separators (includes U+2028).
+_RADIO_BREAK_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def radio_text_is_one_line(text: object) -> bool:
+    """True when text is a single visible line the radio can show unchanged.
+
+    `splitlines` catches Unicode line breaks that are not `\\n` or `\\r`.
+    A character in Cc, Cf, Zl, or Zp can still sit inside one split line
+    (a trailing break, or U+202E) and is refused too. A backtick fence is refused.
+    """
+    if not isinstance(text, str) or text == "":
+        return False
+    if "```" in text or len(text.splitlines()) != 1:
+        return False
+    return all(unicodedata.category(ch) not in _RADIO_BREAK_CATEGORIES for ch in text)
 
 
 def radio_approval_line(command: object, description: object, chunk: int) -> str | None:
     """One radio line from the structured command and description, or None.
 
     None means do not transmit. The command inside a returned line is exactly
-    `command`, which is what `/approve` runs. A newline, a backtick fence, or a
-    line that would have to be cut returns None. The long prompt text is not read.
+    `command`, which is what `/approve` runs. A line break, a format character,
+    a backtick fence, or a line that would have to be cut returns None.
+    The long prompt text is not read.
     """
     if not isinstance(command, str) or not isinstance(description, str) or command == "":
         return None
-    if "\n" in command or "\r" in command or "```" in command:
+    if not radio_text_is_one_line(command):
         return None
-    if "\n" in description or "\r" in description or "```" in description:
+    if description and not radio_text_is_one_line(description):
         return None
     line = f"{APPROVAL_PREFIX}Run: {command}"
     if description:
