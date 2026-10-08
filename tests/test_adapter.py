@@ -53,6 +53,23 @@ class _Iface:
         return {"id": len(self.sent)}
 
 
+def _hold_pending(session_key: str, command: str) -> None:
+    """Queue the command /approve would run. The prompt must carry this exact string."""
+    from tools import approval
+
+    entry = type("_Pending", (), {})()
+    entry.data = {"command": command}
+    with approval._lock:
+        approval._gateway_queues.setdefault(session_key, []).append(entry)
+
+
+def _clear_pending(session_key: str) -> None:
+    from tools import approval
+
+    with approval._lock:
+        approval._gateway_queues.pop(session_key, None)
+
+
 def test_create_adapter_then_handle_message_sends_pong():
     _register()
     created = platform_registry.create_adapter("radio-dm-gateway", _config())
@@ -648,15 +665,17 @@ def test_hermes_text_approval_question_goes_out_only_when_it_fits_one_chunk(monk
         for text in (question, long_question):
             results.append(await asyncio.create_task(created.send(
                 "!aabbccdd", text, metadata={"is_approval_prompt": True})))
+        _hold_pending("s-fit", command)
         results.append(await created._send_exec_approval_prompt(ExecApprovalPrompt(
             chat_id="!aabbccdd",
-            session_key="s",
+            session_key="s-fit",
             text=question,
             actions=[("Allow Once", "once", "primary")],
             command=command,
             description="recursive delete",
             smart_denied=False,
         )))
+        _clear_pending("s-fit")
         return None
 
     async def run():
@@ -1109,24 +1128,28 @@ def test_an_unsent_exec_approval_is_declined_so_hermes_drops_it(monkeypatch):
     async def handler(_event):
         long_prompt = ExecApprovalPrompt(
             chat_id="!aabbccdd",
-            session_key="s",
+            session_key="s-long",
             text="x" * 500,
             actions=[("Allow Once", "once", "primary")],
             command="x" * 400,
             description="long",
             smart_denied=False,
         )
+        _hold_pending("s-long", "x" * 400)
         box["long"] = await created._send_exec_approval_prompt(long_prompt)
+        _clear_pending("s-long")
         short_prompt = ExecApprovalPrompt(
             chat_id="!aabbccdd",
-            session_key="s",
+            session_key="s-short",
             text="echo hi",
             actions=[("Allow Once", "once", "primary")],
             command="echo hi",
             description="list",
             smart_denied=False,
         )
+        _hold_pending("s-short", "echo hi")
         box["short"] = await created._send_exec_approval_prompt(short_prompt)
+        _clear_pending("s-short")
         return None
 
     async def run():
@@ -1161,24 +1184,29 @@ def test_a_command_that_contains_a_fence_is_not_transmitted(monkeypatch):
     shown = "Heading\n```\necho hi\n```\nWhy it was flagged: recursive delete"
 
     async def handler(_event):
+        _hold_pending("s-fence", command)
         box["fence"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
             chat_id="!aabbccdd",
-            session_key="s",
+            session_key="s-fence",
             text=shown,
             actions=[("Allow Once", "once", "primary")],
             command=command,
             description="recursive delete",
             smart_denied=False,
         ))
+        _clear_pending("s-fence")
+        newline = "echo a\necho b"
+        _hold_pending("s-newline", newline)
         box["newline"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
             chat_id="!aabbccdd",
-            session_key="s",
+            session_key="s-newline",
             text="echo a\necho b",
             actions=[("Allow Once", "once", "primary")],
-            command="echo a\necho b",
+            command=newline,
             description="two lines",
             smart_denied=False,
         ))
+        _clear_pending("s-newline")
         box["bare"] = await created._send_exec_approval_prompt(type("Bare", (), {
             "chat_id": "!aabbccdd",
             "text": shown,
@@ -1196,6 +1224,158 @@ def test_a_command_that_contains_a_fence_is_not_transmitted(monkeypatch):
     assert box["newline"].success is False and declined_send(box["newline"]) is True
     assert box["bare"].success is False and declined_send(box["bare"]) is True
     assert iface.sent == []
+
+
+def test_a_redacted_command_is_not_transmitted(monkeypatch):
+    """Hermes shows a redacted copy. /approve runs the original. Those must not be aired apart."""
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from agent.redact import redact_sensitive_text
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    original = "rm -r /tmp/radio-redact-missing sk-radioaudit00"
+    shown = redact_sensitive_text(original, force=True)
+    assert shown != original
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        _hold_pending("s-redact", original)
+        box["redacted"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-redact",
+            text=shown,
+            actions=[("Allow Once", "once", "primary")],
+            command=shown,
+            description="delete in root path",
+            smart_denied=False,
+        ))
+        _clear_pending("s-redact")
+        # An older different command is what /approve would run. Do not air the newer one.
+        _hold_pending("s-order", "echo first")
+        _hold_pending("s-order", "echo second")
+        box["newer"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-order",
+            text="echo second",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo second",
+            description="list",
+            smart_denied=False,
+        ))
+        box["oldest"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-order",
+            text="echo first",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo first",
+            description="list",
+            smart_denied=False,
+        ))
+        _clear_pending("s-order")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "red1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["redacted"].success is False and declined_send(box["redacted"]) is True
+    assert box["newer"].success is False and declined_send(box["newer"]) is True
+    assert box["oldest"].success is True
+    aired = [text for _dest, text, _ack in iface.sent]
+    assert len(aired) == 1
+    assert aired[0].split("Run: ", 1)[1].split(" — ", 1)[0] == "echo first"
+    assert "sk-radioaudit00" not in aired[0]
+    assert shown not in "\n".join(aired)
+
+
+def test_a_missing_approval_queue_is_not_transmitted(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+    import tools.approval as approval
+
+    monkeypatch.delattr(approval, "get_pending_gateway_approval")
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        box["result"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-missing",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        ))
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "miss1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["result"].success is False and declined_send(box["result"]) is True
+    assert iface.sent == []
+
+
+def test_a_full_transmit_queue_does_not_call_send_text(monkeypatch):
+    import radio
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(radio, "SEND_QUEUE_SECONDS", 0.05)
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    iface.queueStatus = type("Queue", (), {"free": 0})()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    def _prompt():
+        return ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-queue",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        )
+
+    async def handler(_event):
+        _hold_pending("s-queue", "echo hi")
+        box["full"] = await created._send_exec_approval_prompt(_prompt())
+        iface.queueStatus.free = 1
+        box["free"] = await created._send_exec_approval_prompt(_prompt())
+        _clear_pending("s-queue")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "q1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["full"].success is False and declined_send(box["full"]) is True
+    assert box["full"].error == "The radio queue is full. Nothing was sent."
+    assert not (isinstance(box["full"].raw_response, dict) and box["full"].raw_response.get("may_have_reached"))
+    assert box["free"].success is True
+    assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_line("echo hi", "list", 200)]
 
 
 def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):

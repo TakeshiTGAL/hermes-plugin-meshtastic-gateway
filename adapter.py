@@ -39,6 +39,7 @@ if __package__:
         CONFIRM_CUT_NOTE,
     )
     from .radio import (
+        RadioNotSent,
         close_interface,
         local_node,
         open_interface,
@@ -77,6 +78,7 @@ else:
         CONFIRM_CUT_NOTE,
     )
     from radio import (
+        RadioNotSent,
         close_interface,
         local_node,
         open_interface,
@@ -137,6 +139,25 @@ def _approval_scope_phrases() -> tuple[str, ...] | None:
     except Exception:
         return None
     return tuple(words)
+
+
+def _approve_will_run(session_key: object, command: object) -> bool:
+    """True when the next /approve for this session runs exactly `command`.
+
+    Hermes redacts the command before it builds the prompt, and /approve runs
+    the oldest pending command, which is the original. A missing reader, an
+    empty session, or any other string means the radio must not show a line.
+    """
+    if not isinstance(session_key, str) or session_key == "" or not isinstance(command, str):
+        return False
+    try:
+        from tools.approval import get_pending_gateway_approval
+        pending = get_pending_gateway_approval(session_key)
+    except Exception:
+        return False
+    if not isinstance(pending, dict):
+        return False
+    return pending.get("command") == command
 
 
 def _undelivered_approval(result: SendResult) -> SendResult:
@@ -643,6 +664,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
             try:
                 # Off the event loop: the library can block while the link is down.
                 packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
+            except RadioNotSent:
+                # sendText was not called. This chunk is not on the radio.
+                note = (
+                    f"Sent {len(sent)} of {len(chunks)}. The radio queue is full. This chunk was not sent."
+                    if sent
+                    else "The radio queue is full. Nothing was sent."
+                )
+                return self._forget_failed_reply(SendResult(
+                    success=False,
+                    error=note,
+                    message_id=sent[-1] if sent else None,
+                    retryable=False,
+                    raw_response={"chunks_sent": len(sent)},
+                ))
             except Exception:
                 # The class name is omitted on purpose. Hermes retries when the error text contains
                 # connectionreset, connectionerror, and the other names in _RETRYABLE_ERROR_PATTERNS,
@@ -672,8 +707,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         The radio line is the structured command and description. The long prompt
         text is not parsed. A newline, a backtick fence, a command that does not
-        fit one chunk, or a Hermes build with no command field is not transmitted.
-        A decline drops the pending approval, so /approve cannot run it.
+        fit one chunk, a command that is not the one /approve will run, or a
+        Hermes build with no command field is not transmitted. A decline drops
+        the pending approval, so /approve cannot run it.
         """
         meta = dict(getattr(prompt, "metadata", None) or {})
         meta["is_approval_prompt"] = True
@@ -682,6 +718,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 success=False,
                 retryable=False,
                 error="The approval command is not available. Nothing was sent.",
+            ))
+        if not _approve_will_run(getattr(prompt, "session_key", None), prompt.command):
+            return _undelivered_approval(SendResult(
+                success=False,
+                retryable=False,
+                error="The approval command was not sent.",
             ))
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
         line = radio_approval_line(prompt.command, prompt.description, size)

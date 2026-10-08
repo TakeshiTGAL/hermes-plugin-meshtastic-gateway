@@ -10,9 +10,17 @@ socket.create_connection, and it does not limit the library's later reconnects.
 from __future__ import annotations
 
 import socket
+import time
 from typing import Any, Callable
 
 OPEN_SECONDS = 20
+# The library waits forever while the radio's transmit queue reports free == 0.
+# Stop before sendText, so a full queue is "nothing was sent", not a maybe.
+SEND_QUEUE_SECONDS = 12
+
+
+class RadioNotSent(Exception):
+    """sendText was not called. The radio queue had no free slot in time."""
 
 
 def _open_tcp(spec: dict) -> Any:
@@ -72,8 +80,31 @@ def local_node(iface: Any) -> str | None:
     return node_id(number)
 
 
+def _tx_slot_is_free(iface: Any) -> bool | None:
+    """True when sendText will not wait on the queue. False when it would. None if unreadable."""
+    status = getattr(iface, "queueStatus", None)
+    if status is None:
+        return True
+    free = getattr(status, "free", None)
+    # bool is an int. A flag is not a free-slot count.
+    if isinstance(free, bool) or not isinstance(free, int):
+        return None
+    return free > 0
+
+
 def send_text(iface: Any, node: str, text: str) -> str:
-    """One unreliable text. wantAck stays false so this call does not ask for retries."""
+    """One unreliable text. wantAck stays false so this call does not ask for retries.
+
+    A full transmit queue raises RadioNotSent before sendText. The socket was not written.
+    """
+    deadline = time.monotonic() + SEND_QUEUE_SECONDS
+    while True:
+        slot = _tx_slot_is_free(iface)
+        if slot is True:
+            break
+        if slot is None or time.monotonic() >= deadline:
+            raise RadioNotSent("The radio queue is full. Nothing was sent.")
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
     packet = iface.sendText(text, destinationId=node, wantAck=False)
     packet_id = getattr(packet, "id", None)
     if packet_id is None and isinstance(packet, dict):
