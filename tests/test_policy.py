@@ -221,17 +221,30 @@ def test_radio_commands_are_an_allowlist():
     assert policy.session_reset_command("!new@bot") is True
     assert policy.session_reset_command("/undo") is False
     assert policy.session_reset_command("hello") is False
-    assert len(b"Turn still running. /new and /reset refused. Session not reset.") <= 64
-    for line in (
-        policy.slash_confirm_line("/new", ""),
-        policy.slash_confirm_line("/reset", ""),
-        policy.slash_confirm_line("/undo", ""),
-        policy.slash_confirm_line("/undo", "the last 12 user turns"),
-    ):
-        assert len(line.encode("utf-8")) <= 64
+    assert len(policy.BUSY_RESET_REFUSAL.encode("utf-8")) <= 64
     assert policy.short_unscoped_reply("hello-from-radio") is True
     assert policy.short_unscoped_reply("x" * 41) is False
     assert policy.short_unscoped_reply("") is False
+
+
+def test_fixed_refusal_and_confirm_lines_fit_one_floor_chunk():
+    lines = [
+        policy.APPROVAL_SCOPE_REFUSAL,
+        policy.APPROVAL_WORD_REFUSAL,
+        policy.COMMAND_REFUSAL,
+        policy.BUSY_RESET_REFUSAL,
+        policy.CONFIRM_CUT_NOTE,
+        policy.slash_confirm_line("/new", "discards the current conversation history"),
+        policy.slash_confirm_line("/reset", ""),
+        policy.slash_confirm_line("/undo", "the last user/assistant exchange"),
+        policy.slash_confirm_line("/undo", "the last 3 user turns"),
+        policy.slash_confirm_line("/undo", "session 20261008 removes the last 2 turns"),
+        policy.slash_confirm_line("/undo", "the last 12 user turns"),
+    ]
+    assert len(lines) == len(set(lines))
+    for line in lines:
+        size = len(line.encode("utf-8"))
+        assert size <= 64, (size, line)
 
 
 def test_approval_question_is_made_short():

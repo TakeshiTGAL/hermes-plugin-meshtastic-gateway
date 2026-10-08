@@ -32,6 +32,11 @@ if __package__:
         short_unscoped_reply,
         slash_confirm_line,
         widens_approval,
+        APPROVAL_SCOPE_REFUSAL,
+        APPROVAL_WORD_REFUSAL,
+        BUSY_RESET_REFUSAL,
+        COMMAND_REFUSAL,
+        CONFIRM_CUT_NOTE,
     )
     from .radio import (
         close_interface,
@@ -65,6 +70,11 @@ else:
         short_unscoped_reply,
         slash_confirm_line,
         widens_approval,
+        APPROVAL_SCOPE_REFUSAL,
+        APPROVAL_WORD_REFUSAL,
+        BUSY_RESET_REFUSAL,
+        COMMAND_REFUSAL,
+        CONFIRM_CUT_NOTE,
     )
     from radio import (
         close_interface,
@@ -82,16 +92,12 @@ _from_radio: contextvars.ContextVar[bool] = contextvars.ContextVar("meshtastic_f
 PLATFORM = "radio-dm-gateway"
 # Hermes waits 15 seconds for an approval question to be sent. This send must end before that.
 APPROVAL_SEND_SECONDS = 12
-APPROVAL_SCOPE_REFUSAL = (
-    "Over the radio, approval is one time only. always and session are refused. "
-    "Send /approve to allow this once, or /deny."
-)
-APPROVAL_WORD_REFUSAL = APPROVAL_SCOPE_REFUSAL + " To send the word itself, add more words."
-COMMAND_REFUSAL = (
-    "Over the radio, only these commands are accepted: /approve (once only), /deny, /cancel, /stop, "
-    "/new, /reset, /help, /status, /whoami, /retry, /undo."
-)
-BUSY_RESET_REFUSAL = "Turn still running. /new and /reset refused. Session not reset."
+_PLUGIN_REFUSALS = frozenset({
+    APPROVAL_SCOPE_REFUSAL,
+    APPROVAL_WORD_REFUSAL,
+    COMMAND_REFUSAL,
+    BUSY_RESET_REFUSAL,
+})
 
 
 def _text_as_hermes_reads_it(event: MessageEvent, text: str) -> str:
@@ -184,6 +190,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._listener = None
         self._lost = None
         self._send_tasks: set[asyncio.Task] = set()
+        # _accept itself. Hermes sends the busy acknowledgement on this task, not on the turn task.
+        self._packet_tasks: set[asyncio.Task] = set()
         self._turn_tasks: dict[asyncio.Task, str | None] = {}
         self._turn_nodes: dict[str, int] = {}
         # The handler task only, and only until the handler returns. Hermes sends the final reply after that.
@@ -298,9 +306,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._turn_tasks.pop(task, None)
         self._release_turn_node(node)
 
-    def _may_send(self, dest: str, metadata: dict | None) -> bool:
-        """The turn task may send the final reply. An approval question for that same node may also be sent. A nested task may not."""
+    def _may_send(self, dest: str, metadata: dict | None, content: str = "") -> bool:
+        """The turn task may send the final reply. The packet task may send only this plugin's refusal.
+
+        Hermes writes the busy acknowledgement on the task that accepted the packet.
+        That task is in _send_tasks, so a destination check alone lets the acknowledgement
+        onto the radio. A refusal written here is the only text that task may send.
+        """
         task = asyncio.current_task()
+        if task in self._packet_tasks and content not in _PLUGIN_REFUSALS:
+            return False
         if self._send_tasks:
             if task in self._send_tasks and _reply_node.get() == dest:
                 return True
@@ -451,6 +466,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         task = asyncio.current_task()
         if task is not None:
             self._send_tasks.add(task)
+            self._packet_tasks.add(task)
         # Hermes resets /new and /reset without asking when a turn is already running.
         already_busy = self._turn_nodes.get(item["node"], 0) > 0
         self._hold_turn_node(item["node"])
@@ -484,6 +500,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             _reply_node.reset(token)
             if task is not None:
                 self._send_tasks.discard(task)
+                self._packet_tasks.discard(task)
             self._release_turn_node(item["node"])
 
     async def send(
@@ -507,7 +524,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
             return self._forget_failed_reply(
                 SendResult(success=False, error="The radio is not connected. Nothing was sent.", retryable=False)
             )
-        if not self._may_send(dest, metadata):
+        if not self._may_send(dest, metadata, content or ""):
             return SendResult(
                 success=False,
                 error="Unsolicited radio sends are refused. Nothing was sent.",
@@ -678,7 +695,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
         _chunks, cut = chunk_text(text, size, 1)
         if cut:
-            note = "Confirmation does not fit. Command not run."
+            note = CONFIRM_CUT_NOTE
             await self.send(chat_id, note, metadata=stamped)
             return SendResult(
                 success=False,

@@ -1029,6 +1029,60 @@ def test_new_during_a_running_turn_does_not_reset(monkeypatch):
     assert [text for _dest, text, _ack in iface.sent].count(adapter.BUSY_RESET_REFUSAL) == 2
 
 
+def test_hermes_busy_text_during_a_turn_stays_off_the_radio(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    release = asyncio.Event()
+    handed = []
+    ack = (
+        "↪ Redirected current run. I'll adjust using your correction.\n\n"
+        "💡 First-time tip — I redirected the current run using your message. "
+        "Send `/busy queue` to wait for a separate turn."
+    )
+
+    async def busy(event, _session_key):
+        result = await created.send(event.source.chat_id, ack)
+        handed.append(("ack", result.success))
+        return True
+
+    async def handler(event):
+        handed.append(event.text)
+        if event.text == "go":
+            await release.wait()
+        return "pong"
+
+    async def run():
+        created.set_message_handler(handler)
+        created._busy_session_handler = busy
+        first = asyncio.create_task(created._accept({
+            "node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "ack-1",
+        }))
+        for _ in range(50):
+            if handed[:1] == ["go"]:
+                break
+            await asyncio.sleep(0)
+        await created._accept({
+            "node": "!aabbccdd", "text": "second", "channel": False, "packet_id": "ack-2",
+        })
+        release.set()
+        await first
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    aired = [text for _dest, text, _ack in iface.sent]
+    joined = "\n".join(aired)
+    assert "Redirected" not in joined
+    assert "First-time tip" not in joined
+    assert "/busy queue" not in joined
+    assert ("ack", False) in handed
+    assert "second" not in handed
+    assert "pong" in aired
+
+
 def test_an_unsent_exec_approval_is_declined_so_hermes_drops_it(monkeypatch):
     monkeypatch.setattr(adapter, "remember", lambda *_args: None)
     from gateway.platforms.base import ExecApprovalPrompt
@@ -1114,7 +1168,7 @@ def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):
     assert "Always Approve" not in " ".join(sent)
     assert box["cut"].success is False
     assert declined_send(box["cut"]) is True
-    assert sent[-1] == "Confirmation does not fit. Command not run."
+    assert sent[-1] == adapter.CONFIRM_CUT_NOTE
 
 
 def test_unreadable_approval_words_refuse_a_short_reply(monkeypatch):

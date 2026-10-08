@@ -336,6 +336,14 @@ WIDE_APPROVAL_PHRASES = frozenset({
 _ATTACHMENT_REFS = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
 
 
+# One radio chunk at the 64-byte floor. A longer fixed line is split, or dropped when it must fit one chunk.
+APPROVAL_SCOPE_REFUSAL = "Once only. always and session are refused."
+APPROVAL_WORD_REFUSAL = "Add more words. always and session are refused."
+COMMAND_REFUSAL = "That command is refused on the radio."
+BUSY_RESET_REFUSAL = "Turn still running. /new and /reset refused. Session not reset."
+CONFIRM_CUT_NOTE = "Confirmation does not fit. Command not run."
+
+
 def slash_confirm_line(title: object, message: object = "") -> str:
     """One radio line for a /new or /undo confirmation.
 
