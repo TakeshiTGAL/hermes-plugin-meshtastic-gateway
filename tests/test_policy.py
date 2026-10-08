@@ -204,6 +204,22 @@ def test_radio_commands_are_an_allowlist():
     for text in ("/approve", "/approve once", "/deny", "/cancel", "/stop", "/new", "/reset", "/help", "/STATUS@bot",
                  "/whoami", "/retry", "/undo", "hello", "/home/me/file is broken", ""):
         assert policy.radio_command_refusal(text) is None, text
+    assert policy.slash_confirm_line("/new", "discards the current conversation history") == (
+        "/new discards history. /approve or /cancel. always refused."
+    )
+    assert policy.slash_confirm_line("/undo", "the last user/assistant exchange") == (
+        "/undo drops last exchange. /approve or /cancel. always refused."
+    )
+    assert policy.slash_confirm_line("/undo", "the last 3 user turns") == (
+        "/undo drops 3 turns. /approve or /cancel. always refused."
+    )
+    for line in (
+        policy.slash_confirm_line("/new", ""),
+        policy.slash_confirm_line("/reset", ""),
+        policy.slash_confirm_line("/undo", ""),
+        policy.slash_confirm_line("/undo", "the last 12 user turns"),
+    ):
+        assert len(line.encode("utf-8")) <= 64
     assert policy.short_unscoped_reply("hello-from-radio") is True
     assert policy.short_unscoped_reply("x" * 41) is False
     assert policy.short_unscoped_reply("") is False

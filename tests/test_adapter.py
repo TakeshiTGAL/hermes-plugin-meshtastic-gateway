@@ -1064,7 +1064,8 @@ def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):
     asyncio.run(run())
     assert box["fit"].success is True
     sent = [text for _dest, text, _ack in iface.sent]
-    assert sent[0] == "Confirm /new. /approve once or /cancel. always refused."
+    assert sent[0] == "/new discards history. /approve or /cancel. always refused."
+    assert len(sent[0].encode("utf-8")) <= 64
     assert "Always Approve" not in " ".join(sent)
     assert box["cut"].success is False
     assert declined_send(box["cut"]) is True

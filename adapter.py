@@ -29,6 +29,7 @@ if __package__:
         radio_approval_text,
         radio_command_refusal,
         short_unscoped_reply,
+        slash_confirm_line,
         widens_approval,
     )
     from .radio import (
@@ -60,6 +61,7 @@ else:
         radio_approval_text,
         radio_command_refusal,
         short_unscoped_reply,
+        slash_confirm_line,
         widens_approval,
     )
     from radio import (
@@ -662,7 +664,7 @@ class MeshtasticAdapter(BasePlatformAdapter):
         A decline makes Hermes drop the pending confirmation and not send the
         long prompt, which names /always and is cut when the chunk is small.
         """
-        text = f"Confirm {title}. /approve once or /cancel. always refused."
+        text = slash_confirm_line(title, message)
         stamped = dict(metadata or {})
         stamped["radio_confirm"] = True
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)

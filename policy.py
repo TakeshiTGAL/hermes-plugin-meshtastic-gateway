@@ -336,6 +336,28 @@ WIDE_APPROVAL_PHRASES = frozenset({
 _ATTACHMENT_REFS = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
 
 
+def slash_confirm_line(title: object, message: object = "") -> str:
+    """One radio line for a /new or /undo confirmation.
+
+    /new and its alias /reset discard the conversation. /undo drops one exchange,
+    or the count Hermes wrote in the prompt. always is not offered.
+    """
+    name = " ".join(str(title or "").split())
+    if name in {"/new", "/reset"}:
+        effect = "discards history"
+    elif name == "/undo":
+        count = 1
+        for raw in re.findall(r"\d+", str(message or "")):
+            number = int(raw)
+            if number > 1:
+                count = number
+                break
+        effect = "drops last exchange" if count == 1 else f"drops {count} turns"
+    else:
+        effect = "changes this session"
+    return f"{name} {effect}. /approve or /cancel. always refused."
+
+
 def short_unscoped_reply(text: object) -> bool:
     """True when the text is short enough to be one always or session word.
 
