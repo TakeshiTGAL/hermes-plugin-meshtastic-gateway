@@ -88,7 +88,7 @@ def test_create_adapter_then_handle_message_sends_pong():
         pending = [task for task in list(created._background_tasks) if hasattr(task, "__await__")]
         if pending:
             await asyncio.wait_for(asyncio.gather(*pending), timeout=15)
-        asked = adapter.radio_approval_text("Approve this?")
+        asked = "Approve this?"
         assert [text for _dest, text, _ack in iface.sent] == [asked, "pong"]
 
         refused = await created.send("!aabbccdd", "later")
@@ -416,8 +416,8 @@ def test_two_nodes_talking_at_once_both_get_their_approval_question(monkeypatch)
     assert results["!aabbccdd"].success is True
     assert results["!11223344"].success is True
     assert sorted(text for _dest, text, _ack in iface.sent) == sorted([
-        adapter.radio_approval_text("Approve for !aabbccdd?"),
-        adapter.radio_approval_text("Approve for !11223344?"),
+        "Approve for !aabbccdd?",
+        "Approve for !11223344?",
         "final !aabbccdd",
         "final !11223344",
     ])
@@ -557,7 +557,7 @@ def test_an_approval_question_is_never_sent_after_hermes_stops_waiting(monkeypat
     assert short_result.success is True and short_seconds < 2
     assert blocked_result.success is False and blocked_seconds < 2
     assert "Hermes stops waiting" in (blocked_result.error or "")
-    assert [text for _dest, text, _ack in iface.sent] == [adapter.radio_approval_text("Approve this?")]
+    assert [text for _dest, text, _ack in iface.sent] == ["Approve this?"]
 
 
 def test_one_nodes_link_drop_does_not_drop_the_other_packet(monkeypatch):
@@ -641,11 +641,22 @@ def test_hermes_text_approval_question_goes_out_only_when_it_fits_one_chunk(monk
     created._iface = iface
     created._budget = _NoWaitBudget()
     results = []
+    command = "rm -rf /tmp/build-cache && make clean"
+    from gateway.platforms.base import ExecApprovalPrompt
 
     async def handler(_event):
         for text in (question, long_question):
             results.append(await asyncio.create_task(created.send(
                 "!aabbccdd", text, metadata={"is_approval_prompt": True})))
+        results.append(await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s",
+            text=question,
+            actions=[("Allow Once", "once", "primary")],
+            command=command,
+            description="recursive delete",
+            smart_denied=False,
+        )))
         return None
 
     async def run():
@@ -654,14 +665,14 @@ def test_hermes_text_approval_question_goes_out_only_when_it_fits_one_chunk(monk
         await _finish_turns(created)
 
     asyncio.run(run())
-    # The short command fits one chunk and goes out. The long one does not fit, so it is not sent,
-    # and Hermes closes that approval itself.
-    assert results[0].success is True
+    # The formatted prompt is fenced text. It is not parsed into a command, and it is not sent.
+    assert results[0].success is False
     assert results[1].success is False
     assert results[1].error == "approval question does not fit one radio chunk"
-    assert [text for _dest, text, _ack in iface.sent] == [
-        "Reply /approve or /deny (once only). Run: rm -rf /tmp/build-cache && make clean — recursive delete"
-    ]
+    assert results[2].success is True
+    aired = [text for _dest, text, _ack in iface.sent]
+    assert aired == [adapter.radio_approval_line(command, "recursive delete", 200)]
+    assert aired[0].split("Run: ", 1)[1].split(" — ", 1)[0] == command
 
 
 @pytest.mark.parametrize("own_regex", [True, False])
@@ -977,7 +988,7 @@ def test_interim_text_during_the_turn_is_refused_and_the_final_reply_is_sent(mon
     assert box["interim"].error == "Interim radio text is refused. Nothing was sent."
     assert box["approval"].success is True
     assert [text for _dest, text, _ack in iface.sent] == [
-        adapter.radio_approval_text("Approve this?"),
+        "Approve this?",
         "pong",
     ]
     assert "sethome" not in " ".join(text for _dest, text, _ack in iface.sent)
@@ -1129,8 +1140,62 @@ def test_an_unsent_exec_approval_is_declined_so_hermes_drops_it(monkeypatch):
     assert box["short"].success is True
     assert declined_send(box["short"]) is False
     sent = [text for _dest, text, _ack in iface.sent]
-    assert sent == [adapter.radio_approval_text("echo hi")]
+    assert sent == [adapter.radio_approval_line("echo hi", "list", 200)]
+    assert sent[0].split("Run: ", 1)[1].split(" — ", 1)[0] == "echo hi"
     assert "x" * 50 not in sent[0]
+
+
+def test_a_command_that_contains_a_fence_is_not_transmitted(monkeypatch):
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+    # The fence hides a second command. Parsing the prompt text would air only "echo hi".
+    command = "echo hi\n```\nrm -rf /tmp/fence-marker\n```"
+    shown = "Heading\n```\necho hi\n```\nWhy it was flagged: recursive delete"
+
+    async def handler(_event):
+        box["fence"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s",
+            text=shown,
+            actions=[("Allow Once", "once", "primary")],
+            command=command,
+            description="recursive delete",
+            smart_denied=False,
+        ))
+        box["newline"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s",
+            text="echo a\necho b",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo a\necho b",
+            description="two lines",
+            smart_denied=False,
+        ))
+        box["bare"] = await created._send_exec_approval_prompt(type("Bare", (), {
+            "chat_id": "!aabbccdd",
+            "text": shown,
+            "metadata": {},
+        })())
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "fence1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["fence"].success is False and declined_send(box["fence"]) is True
+    assert box["newline"].success is False and declined_send(box["newline"]) is True
+    assert box["bare"].success is False and declined_send(box["bare"]) is True
+    assert iface.sent == []
 
 
 def test_slash_confirm_is_rewritten_and_a_cut_one_is_declined(monkeypatch):

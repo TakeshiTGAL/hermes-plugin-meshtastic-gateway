@@ -449,30 +449,28 @@ def session_reset_command(text: object) -> bool:
 
 
 APPROVAL_PREFIX = "Reply /approve or /deny (once only). "
-_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)\n?```", re.DOTALL)
 
 
-def radio_approval_text(text: object) -> str:
-    """Hermes' approval question, made short for one radio chunk.
+def radio_approval_line(command: object, description: object, chunk: int) -> str | None:
+    """One radio line from the structured command and description, or None.
 
-    "Reply /approve or /deny (once only). Run: <command> — <reason>". Without a code block,
-    the prefix goes in front of the original text.
+    None means do not transmit. The command inside a returned line is exactly
+    `command`, which is what `/approve` runs. A newline, a backtick fence, or a
+    line that would have to be cut returns None. The long prompt text is not read.
     """
-    raw = str(text or "")
-    match = _CODE_BLOCK.search(raw)
-    if match is None:
-        return APPROVAL_PREFIX + raw.strip()
-    command = match.group(1).strip()
-    reason = ""
-    for line in raw[match.end():].splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        label, sep, rest = line.partition(": ")
-        reason = rest.strip() if sep else ("" if line.endswith(":") else line)
-        break
-    out = f"{APPROVAL_PREFIX}Run: {command}"
-    return f"{out} — {reason}" if reason else out
+    if not isinstance(command, str) or not isinstance(description, str) or command == "":
+        return None
+    if "\n" in command or "\r" in command or "```" in command:
+        return None
+    if "\n" in description or "\r" in description or "```" in description:
+        return None
+    line = f"{APPROVAL_PREFIX}Run: {command}"
+    if description:
+        line = f"{line} — {description}"
+    parts, cut = chunk_text(line, chunk, 1)
+    if cut or parts != [line]:
+        return None
+    return line
 
 
 # Hermes rewrites these plain-text phrases to /restart before it reads the command

@@ -247,10 +247,20 @@ def test_fixed_refusal_and_confirm_lines_fit_one_floor_chunk():
         assert size <= 64, (size, line)
 
 
-def test_approval_question_is_made_short():
-    question = "Heading\n```\nls -la\n```\nWhy it was flagged: test\n\nReply `/approve` ..."
-    assert policy.radio_approval_text(question) == "Reply /approve or /deny (once only). Run: ls -la — test"
-    assert policy.radio_approval_text("Approve?") == "Reply /approve or /deny (once only). Approve?"
+def test_approval_line_is_the_command_and_a_fence_is_refused():
+    line = policy.radio_approval_line("ls -la", "test", 200)
+    assert line == "Reply /approve or /deny (once only). Run: ls -la — test"
+    assert line.split("Run: ", 1)[1].split(" — ", 1)[0] == "ls -la"
+    assert policy.radio_approval_line("ls -la", "", 200) == "Reply /approve or /deny (once only). Run: ls -la"
+    fenced = "echo hi\n```\nrm -rf /tmp/fence-marker\n```"
+    assert policy.radio_approval_line(fenced, "recursive delete", 200) is None
+    assert policy.radio_approval_line("echo ```hidden```", "reason", 200) is None
+    assert policy.radio_approval_line("echo a\necho b", "reason", 200) is None
+    assert policy.radio_approval_line("echo hi", "reason\nwith a second line", 200) is None
+    assert policy.radio_approval_line("z" * 180, "why", 64) is None
+    assert policy.radio_approval_line("echo hi", "y" * 300, 200) is None
+    assert policy.radio_approval_line("", "reason", 200) is None
+    assert policy.radio_approval_line(None, "reason", 200) is None
 
 
 def test_plain_text_restart_phrases_are_read_as_restart():

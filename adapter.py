@@ -26,7 +26,7 @@ if __package__:
         parse_allowlist,
         parse_url,
         plaintext_restart,
-        radio_approval_text,
+        radio_approval_line,
         radio_command_refusal,
         session_reset_command,
         short_unscoped_reply,
@@ -64,7 +64,7 @@ else:
         parse_allowlist,
         parse_url,
         plaintext_restart,
-        radio_approval_text,
+        radio_approval_line,
         radio_command_refusal,
         session_reset_command,
         short_unscoped_reply,
@@ -544,11 +544,17 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     error="confirmation does not fit one radio chunk",
                 )
         elif approval:
-            # One short chunk: the long Hermes question would need several gaps, and only once is accepted here.
-            chunks, cut = chunk_text(radio_approval_text(content), size, 1)
-            if cut:
-                # Nobody may approve a command they could not read in full.
-                # _send_exec_approval_prompt turns this into a decline so Hermes drops the queue.
+            # The line was built from the command. Do not parse it, and do not cut it.
+            # A fence or a newline here is the long prompt, not the command that will run.
+            body = content or ""
+            if "\n" in body or "\r" in body or "```" in body:
+                return SendResult(
+                    success=False,
+                    retryable=False,
+                    error="approval question does not fit one radio chunk",
+                )
+            chunks, cut = chunk_text(body, size, 1)
+            if cut or not chunks:
                 return SendResult(
                     success=False,
                     retryable=False,
@@ -664,13 +670,28 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def _send_exec_approval_prompt(self, prompt) -> SendResult:
         """Send one approval question as text, on Hermes' button path.
 
-        Overriding this method makes Hermes call it instead of the plain-text
-        notify path. A decline drops the pending approval. success=False on the
-        plain-text path would leave /approve able to run the unseen command.
+        The radio line is the structured command and description. The long prompt
+        text is not parsed. A newline, a backtick fence, a command that does not
+        fit one chunk, or a Hermes build with no command field is not transmitted.
+        A decline drops the pending approval, so /approve cannot run it.
         """
         meta = dict(getattr(prompt, "metadata", None) or {})
         meta["is_approval_prompt"] = True
-        result = await self.send(getattr(prompt, "chat_id", ""), getattr(prompt, "text", "") or "", metadata=meta)
+        if not hasattr(prompt, "command") or not hasattr(prompt, "description"):
+            return _undelivered_approval(SendResult(
+                success=False,
+                retryable=False,
+                error="The approval command is not available. Nothing was sent.",
+            ))
+        size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
+        line = radio_approval_line(prompt.command, prompt.description, size)
+        if line is None:
+            return _undelivered_approval(SendResult(
+                success=False,
+                retryable=False,
+                error="The approval command was not sent.",
+            ))
+        result = await self.send(getattr(prompt, "chat_id", ""), line, metadata=meta)
         if result.success:
             return result
         return _undelivered_approval(result)
