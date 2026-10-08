@@ -1,6 +1,6 @@
 # radio-dm-gateway
 
-Talk to Hermes over a radio, built on the Meshtastic® Python API. Meshtastic® is a registered trademark of Meshtastic LLC. This site is not affiliated with or endorsed by the Meshtastic project. The GitHub repository is still named hermes-plugin-meshtastic-gateway. That is where it is published. The product name is radio-dm-gateway.
+Talk to Hermes over a radio, built on the Meshtastic® Python API. Meshtastic® is a registered trademark of Meshtastic LLC. This site is not affiliated with or endorsed by the Meshtastic project. The repository was renamed on 2026-10-08 from hermes-plugin-meshtastic-gateway to hermes-plugin-radio-dm-gateway; GitHub redirects the old URL.
 
 If you already installed the old name: run `hermes plugins remove meshtastic-gateway`, then install this repository again.
 In `config.yaml`, rename `platforms.meshtastic-gateway` to `platforms.radio-dm-gateway` and keep the same URL and allowlist.

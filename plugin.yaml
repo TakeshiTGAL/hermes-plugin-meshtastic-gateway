@@ -14,7 +14,7 @@ description: >-
   sends are refused. Cron does not transmit. TCP only.
 author: TakeshiTGAL
 license: GPL-3.0-only
-homepage: https://github.com/TakeshiTGAL/hermes-plugin-meshtastic-gateway
+homepage: https://github.com/TakeshiTGAL/hermes-plugin-radio-dm-gateway
 tags: [lora, radio, gateway]
 requires_env:
   - name: MESHTASTIC_URL
