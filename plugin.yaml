@@ -7,11 +7,14 @@ python_dependencies:
 kind: platform
 description: >-
   Talk to Hermes over a radio, built on the Meshtastic® Python API.
-  Meshtastic® is a registered trademark of Meshtastic LLC. An allowlisted
+  Meshtastic® is a registered trademark of Meshtastic LLC. This site is not
+  affiliated with or endorsed by the Meshtastic project. An allowlisted
   direct message is answered only when pkiEncrypted
   is true. An empty allowlist answers nobody. Channel packets are never
   answered, because a channel key can impersonate a sender. Unsolicited
-  sends are refused. Cron does not transmit. TCP only.
+  sends are refused. This plugin registers no cron job and does not give
+  cron a radio sender. A cron job the agent creates stays until hermes cron
+  remove. TCP only.
 author: TakeshiTGAL
 license: GPL-3.0-only
 homepage: https://github.com/TakeshiTGAL/hermes-plugin-radio-dm-gateway

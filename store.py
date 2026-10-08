@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
 
 _LOCK = threading.Lock()
+_corrupt_warned = False
 
 MAX_RECORDS = 200
 
@@ -21,6 +23,17 @@ def data_dir() -> Path | None:
     except Exception:
         return None
     return path
+
+
+def _warn_corrupt_once() -> None:
+    """Say once that a corrupt nodes.json was left unchanged and recording stopped."""
+    global _corrupt_warned
+    if _corrupt_warned:
+        return
+    _corrupt_warned = True
+    logging.getLogger(__name__).warning(
+        "nodes.json could not be read. It was left unchanged, and new rows are not recorded until you delete it."
+    )
 
 
 def remember(node: str, direction: str, nbytes: int, now: float) -> None:
@@ -38,6 +51,7 @@ def remember(node: str, direction: str, nbytes: int, now: float) -> None:
                     if isinstance(loaded, list):
                         rows = loaded
                 except (OSError, json.JSONDecodeError):
+                    _warn_corrupt_once()
                     return
             rows.append({
                 "node": node,
