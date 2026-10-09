@@ -44,7 +44,7 @@ optional_env:
     prompt: "Seconds between sends"
     password: false
   - name: MESHTASTIC_MAX_PER_HOUR
-    description: "Maximum radio sends in a rolling hour on this adapter. Default 12. Cannot be set above 30. A new adapter, including a Hermes reconnect, starts the hour over and forgets packet ids already seen, so a retransmission can be answered again. The same adapter keeps only the last 100 packet ids, so an older retransmission can be answered again."
+    description: "Maximum radio sends in a rolling hour on this adapter. Default 12. Cannot be set above 30. Hermes reconnect builds a new adapter and connects that new one. The hourly count and the seen packet ids live on the adapter, so the new one starts them over and a retransmission can be answered again. Connecting again on the same adapter does not clear them. The same adapter keeps only the last 100 packet ids, so an older retransmission can be answered again."
     prompt: "Sends per hour"
     password: false
 config_schema: {}

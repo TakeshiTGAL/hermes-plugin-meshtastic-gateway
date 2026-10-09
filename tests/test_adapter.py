@@ -1882,3 +1882,41 @@ def test_a_nodes_file_that_cannot_be_read_still_answers_the_message(monkeypatch,
         assert [text for _dest, text, _ack in iface.sent] == ["answered"], raw[:16]
         assert path.read_bytes() == raw
         created._seen = []
+
+    import json
+    path.write_text('["old"]', encoding="utf-8")
+    store._corrupt_warned = False
+    handed.clear()
+    iface.sent.clear()
+    asyncio.run(run())
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    assert loaded[0] == "old"
+    assert loaded[-1]["node"] == "!aabbccdd"
+    assert handed == ["hello"]
+
+
+def test_connect_again_on_the_same_adapter_keeps_the_hour_and_seen_ids(monkeypatch):
+    """Hermes reconnect builds a new adapter. connect on this object does not clear its hour."""
+    from policy import SendBudget
+
+    monkeypatch.setattr(adapter, "open_interface", lambda _spec: object())
+    monkeypatch.setattr(adapter, "subscribe", lambda *_args, **_kwargs: "sub")
+    monkeypatch.setattr(adapter, "subscribe_lost", lambda *_args, **_kwargs: "lost")
+    monkeypatch.setattr(adapter, "local_node", lambda _iface: "!11223344")
+    monkeypatch.setattr(adapter, "unsubscribe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(adapter, "close_interface", lambda _iface: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    created._seen = ["7"]
+    created._budget = SendBudget(20, 12)
+    created._budget.mark(1.0)
+
+    async def run():
+        return await created.connect(is_reconnect=True)
+
+    assert asyncio.run(run()) is True
+    assert created._seen == ["7"]
+    assert created._budget.sent_at == [1.0]
+    fresh = platform_registry.create_adapter("radio-dm-gateway", _config())
+    assert fresh._seen == []
+    assert fresh._budget is None
