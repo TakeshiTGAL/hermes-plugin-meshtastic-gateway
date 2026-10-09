@@ -230,6 +230,11 @@ def test_radio_commands_are_an_allowlist():
     assert policy.slash_confirm_line("/undo", "the last 2 turns on 09 October") == (
         "/undo drops 2 turns. /approve or /cancel. always refused."
     )
+    assert policy.slash_confirm_line(
+        "/undo", "履歴から最後の 5 件のユーザーターンを削除します。"
+    ) == "/undo drops 5 turns. /approve or /cancel. always refused."
+    assert policy.slash_confirm_line("/undo", "5 things on 09 October") is None
+    assert len(policy.UNDO_COUNT_NOTE.encode("utf-8")) <= 64
     assert policy.session_reset_command("/new") is True
     assert policy.session_reset_command("/reset name") is True
     assert policy.session_reset_command("!new@bot") is True

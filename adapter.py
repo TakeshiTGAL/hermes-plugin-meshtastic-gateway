@@ -39,6 +39,7 @@ if __package__:
         BUSY_RESET_REFUSAL,
         COMMAND_REFUSAL,
         CONFIRM_CUT_NOTE,
+        UNDO_COUNT_NOTE,
     )
     from .radio import (
         RadioNotSent,
@@ -79,6 +80,7 @@ else:
         BUSY_RESET_REFUSAL,
         COMMAND_REFUSAL,
         CONFIRM_CUT_NOTE,
+        UNDO_COUNT_NOTE,
     )
     from radio import (
         RadioNotSent,
@@ -886,6 +888,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
         text = slash_confirm_line(title, message)
         stamped = dict(metadata or {})
         stamped["radio_confirm"] = True
+        if text is None:
+            await self.send(chat_id, UNDO_COUNT_NOTE, metadata=stamped)
+            return SendResult(
+                success=False,
+                retryable=False,
+                error="undo count is not a single number",
+                raw_response={"code": "egress_declined"},
+            )
         size = chunk_bytes(_env(self.config, "MESHTASTIC_CHUNK_BYTES") or 200)
         _chunks, cut = chunk_text(text, size, 1)
         if cut:

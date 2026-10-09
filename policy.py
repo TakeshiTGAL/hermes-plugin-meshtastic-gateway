@@ -350,23 +350,42 @@ APPROVAL_WORD_REFUSAL = "Add more words. always and session are refused."
 COMMAND_REFUSAL = "That command is refused on the radio."
 BUSY_RESET_REFUSAL = "Turn still running. /new and /reset refused. Session not reset."
 CONFIRM_CUT_NOTE = "Confirmation does not fit. Command not run."
+UNDO_COUNT_NOTE = "Undo count is unclear. Command not run."
 
 
-def slash_confirm_line(title: object, message: object = "") -> str:
-    """One radio line for a /new or /undo confirmation.
+def _undo_count(message: object) -> int | None:
+    """The count Hermes put in the prompt, or None when that count is not one number.
+
+    English says ``<N> turns``. Other languages keep the same number without that
+    word. A date beside another number is not a count, so this returns None
+    instead of calling several turns one exchange.
+    """
+    text = str(message or "")
+    named = re.findall(r"(\d+)\s+(?:user\s+)?turns?\b", text, flags=re.IGNORECASE)
+    if named:
+        count = int(named[-1])
+        return count if count >= 2 else 1
+    nums = [int(raw) for raw in re.findall(r"\d+", text)]
+    if not nums:
+        return 1
+    if len(nums) == 1:
+        return nums[0] if nums[0] >= 2 else 1
+    return None
+
+
+def slash_confirm_line(title: object, message: object = "") -> str | None:
+    """One radio line for a /new or /undo confirmation, or None when /undo has no single count.
 
     /new and its alias /reset discard the conversation. /undo drops one exchange,
-    or the count Hermes wrote in the prompt. always is not offered.
+    or the one count in the prompt. always is not offered.
     """
     name = " ".join(str(title or "").split())
     if name in {"/new", "/reset"}:
         effect = "discards history"
     elif name == "/undo":
-        # The integer that names the turns, not a date elsewhere in the prompt.
-        named = re.findall(r"(\d+)\s+(?:user\s+)?turns?\b", str(message or ""), flags=re.IGNORECASE)
-        count = int(named[-1]) if named else 1
-        if count < 2:
-            count = 1
+        count = _undo_count(message)
+        if count is None:
+            return None
         effect = "drops last exchange" if count == 1 else f"drops {count} turns"
     else:
         effect = "changes this session"
