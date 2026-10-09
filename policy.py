@@ -362,9 +362,11 @@ def slash_confirm_line(title: object, message: object = "") -> str:
     if name in {"/new", "/reset"}:
         effect = "discards history"
     elif name == "/undo":
-        # The last integer above 1. A date earlier in the prompt must not become the count.
-        counts = [int(raw) for raw in re.findall(r"\d+", str(message or "")) if int(raw) > 1]
-        count = counts[-1] if counts else 1
+        # The integer that names the turns, not a date elsewhere in the prompt.
+        named = re.findall(r"(\d+)\s+(?:user\s+)?turns?\b", str(message or ""), flags=re.IGNORECASE)
+        count = int(named[-1]) if named else 1
+        if count < 2:
+            count = 1
         effect = "drops last exchange" if count == 1 else f"drops {count} turns"
     else:
         effect = "changes this session"
