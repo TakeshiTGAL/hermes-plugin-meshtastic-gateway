@@ -32,11 +32,18 @@ def _warn_corrupt_once() -> None:
         return
     _corrupt_warned = True
     logging.getLogger(__name__).warning(
-        "nodes.json could not be read as a list of rows. It was left unchanged, and new rows are not recorded until you delete it."
+        "nodes.json could not be read as a list of UTF-8 rows. It was left unchanged, new rows are "
+        "not recorded until you delete it, and direct messages are still answered."
     )
 
 
 def remember(node: str, direction: str, nbytes: int, now: float) -> None:
+    """Add one row. A file this cannot read stops recording, not the reply.
+
+    This runs on the path that hands a direct message to Hermes, so it must not
+    raise: bytes that are not UTF-8, and JSON nested deeper than the interpreter
+    can walk, are read failures like any other.
+    """
     root = data_dir()
     if root is None:
         return
@@ -48,7 +55,7 @@ def remember(node: str, direction: str, nbytes: int, now: float) -> None:
             if path.exists():
                 try:
                     loaded = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                     _warn_corrupt_once()
                     return
                 if not isinstance(loaded, list):
@@ -62,7 +69,12 @@ def remember(node: str, direction: str, nbytes: int, now: float) -> None:
                 "at": now,
             })
             tmp = path.with_name("nodes.json.tmp")
-            tmp.write_text(json.dumps(rows[-MAX_RECORDS:]), encoding="utf-8")
+            try:
+                payload = json.dumps(rows[-MAX_RECORDS:])
+            except (RecursionError, TypeError, ValueError):
+                _warn_corrupt_once()
+                return
+            tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, path)
-    except OSError:
+    except (OSError, RecursionError):
         return

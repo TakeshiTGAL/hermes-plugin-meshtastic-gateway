@@ -1681,3 +1681,204 @@ def test_unreadable_approval_words_refuse_a_short_reply(monkeypatch):
     asyncio.run(run())
     assert handed == ["this reply is longer than forty characters easily"]
     assert [text for _dest, text, _ack in iface.sent] == [adapter.APPROVAL_WORD_REFUSAL]
+
+
+def test_a_surrogate_in_the_command_declines_and_puts_nothing_on_the_radio(monkeypatch):
+    """A lone surrogate used to raise out of the approval mouth.
+
+    Hermes then sent the question as plain text, this adapter refused that text,
+    Hermes did not read the refusal, and /approve still ran the command.
+    """
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    command = "rm -r /tmp/rb-sur-missing\udc80x"
+    box = {}
+
+    async def handler(_event):
+        _hold_pending("s-surrogate", command)
+        box["result"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-surrogate",
+            text=command,
+            actions=[("Allow Once", "once", "primary")],
+            command=command,
+            description="cleanup",
+            smart_denied=False,
+        ))
+        _clear_pending("s-surrogate")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "sur1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["result"].success is False
+    assert declined_send(box["result"]) is True
+    assert iface.sent == []
+
+
+def test_a_broken_approval_mouth_is_still_a_decline(monkeypatch):
+    """Whatever raises inside the mouth, Hermes must be told the question was not sent."""
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("approval line builder down")
+
+    monkeypatch.setattr(adapter, "radio_approval_line", boom)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        _hold_pending("s-boom", "echo hi")
+        box["result"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-boom",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        ))
+        _clear_pending("s-boom")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "boom1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["result"].success is False
+    assert declined_send(box["result"]) is True
+    assert iface.sent == []
+
+
+def test_a_send_text_stuck_inside_the_library_declines_the_approval(monkeypatch):
+    """The 12 second budget covers only this plugin's own waits.
+
+    sendText has its own: up to 30 seconds for the link, and a close-sleep-reopen
+    on a socket error. A send stuck in there must come back as a decline before
+    Hermes stops watching at 15 seconds, and must not leave a second send free to
+    call the library at the same time.
+    """
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.3)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+
+    class _StuckIface:
+        def __init__(self):
+            self.sent = []
+            self.inside = threading.Event()
+            self.release = threading.Event()
+
+        def sendText(self, text, destinationId, wantAck=False):
+            self.inside.set()
+            # The real block is _waitConnected's 30 seconds; the test lets go early.
+            self.release.wait(30)
+            self.sent.append((destinationId, text, wantAck))
+            return {"id": 1}
+
+    iface = _StuckIface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        _hold_pending("s-stuck", "echo hi")
+        started = time.monotonic()
+        box["result"] = await created._send_exec_approval_prompt(ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key="s-stuck",
+            text="echo hi",
+            actions=[("Allow Once", "once", "primary")],
+            command="echo hi",
+            description="list",
+            smart_denied=False,
+        ))
+        box["elapsed"] = time.monotonic() - started
+        box["still_inside"] = iface.inside.is_set() and not iface.release.is_set()
+        box["slot_held"] = created._send_lock.locked()
+        box["orphan"] = created._orphan_send is not None
+        iface.release.set()
+        orphan = created._orphan_send
+        if orphan is not None:
+            await asyncio.wait_for(asyncio.shield(orphan), timeout=10)
+        for _ in range(50):
+            if not created._send_lock.locked():
+                break
+            await asyncio.sleep(0.05)
+        box["slot_free_after"] = not created._send_lock.locked()
+        _clear_pending("s-stuck")
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "stuck1"})
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["result"].success is False
+    assert declined_send(box["result"]) is True
+    assert box["elapsed"] < 5
+    assert box["still_inside"] is True
+    assert box["slot_held"] is True
+    assert box["orphan"] is True
+    assert box["slot_free_after"] is True
+
+
+def test_a_nodes_file_that_cannot_be_read_still_answers_the_message(monkeypatch, tmp_path):
+    """Bytes that are not UTF-8, and JSON nested too deep, stop recording only."""
+    import store
+
+    monkeypatch.setattr(adapter, "remember", store.remember)
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(store, "_corrupt_warned", False)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    path = tmp_path / "nodes.json"
+    handed = []
+
+    async def handler(event):
+        handed.append(event.text)
+        return "answered"
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({"node": "!aabbccdd", "text": "hello", "channel": False, "packet_id": "bad1"})
+        await _finish_turns(created)
+
+    # The depth that overflows differs per interpreter: 1000 raises on 3.9, 20000 on 3.12,
+    # 100000 on 3.14. 200000 raises on all three.
+    for raw in (b'[{"node":"\xff"}]', (b"[" * 200000) + (b"]" * 200000)):
+        handed.clear()
+        iface.sent.clear()
+        store._corrupt_warned = False
+        path.write_bytes(raw)
+        asyncio.run(run())
+        assert handed == ["hello"], raw[:16]
+        assert [text for _dest, text, _ack in iface.sent] == ["answered"], raw[:16]
+        assert path.read_bytes() == raw
+        created._seen = []

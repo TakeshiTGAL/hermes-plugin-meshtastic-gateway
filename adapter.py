@@ -97,6 +97,11 @@ _from_radio: contextvars.ContextVar[bool] = contextvars.ContextVar("meshtastic_f
 PLATFORM = "radio-dm-gateway"
 # Hermes waits 15 seconds for an approval question to be sent. This send must end before that.
 APPROVAL_SEND_SECONDS = 12
+# How much longer than its own budget an approval send waits for the library thread.
+# send_text bounds the waits it makes itself, so this second lets it report
+# "nothing was sent" rather than the coarser "this may still go out". 12 + 1 is
+# still inside the 15 seconds Hermes watches.
+APPROVAL_THREAD_GRACE_SECONDS = 1.0
 _PLUGIN_REFUSALS = frozenset({
     APPROVAL_SCOPE_REFUSAL,
     APPROVAL_WORD_REFUSAL,
@@ -245,6 +250,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._in_handler: set[asyncio.Task] = set()
         # One send at a time, so chunks of two replies never interleave and the gap holds.
         self._send_lock = asyncio.Lock()
+        # A radio thread this adapter stopped waiting for. It still holds the send slot,
+        # because asyncio cannot cancel a thread that is inside the library.
+        self._orphan_send: asyncio.Future | None = None
         # Set by the library's connection-lost event. A send then fails at once instead of
         # waiting up to 30 seconds inside the library for a link that is gone.
         self._radio_lost = False
@@ -634,7 +642,29 @@ class MeshtasticAdapter(BasePlatformAdapter):
         try:
             return await self._send_locked(dest, chunks, cut, approval, started)
         finally:
-            self._send_lock.release()
+            if self._orphan_send is None:
+                self._send_lock.release()
+
+    def _hold_slot_until(self, pending: asyncio.Future) -> None:
+        """Keep the one send slot until a radio thread this adapter gave up on ends.
+
+        asyncio cannot cancel a thread. Releasing the slot now would let a second
+        send call the library while the first is still inside it.
+        """
+        self._orphan_send = pending
+
+        def _done(finished: asyncio.Future) -> None:
+            self._orphan_send = None
+            try:
+                finished.exception()
+            except asyncio.CancelledError:
+                pass
+            try:
+                self._send_lock.release()
+            except RuntimeError:
+                pass
+
+        pending.add_done_callback(_done)
 
     def _radio_up(self) -> bool:
         """False after the library reported the link lost, or while its isConnected flag is down."""
@@ -694,10 +724,33 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 # Hermes stops watching at 15 seconds and keeps the approval if
                 # this call is still running, so the queue wait is only the remainder.
                 if approval:
-                    remain = APPROVAL_SEND_SECONDS - (time.monotonic() - started)
-                    packet_id = await asyncio.to_thread(
-                        send_text, iface, dest, chunk, queue_wait=max(0.0, remain)
+                    remain = max(0.0, APPROVAL_SEND_SECONDS - (time.monotonic() - started))
+                    pending = asyncio.ensure_future(
+                        asyncio.to_thread(send_text, iface, dest, chunk, queue_wait=remain)
                     )
+                    try:
+                        packet_id = await asyncio.wait_for(
+                            asyncio.shield(pending),
+                            timeout=remain + APPROVAL_THREAD_GRACE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        # The budget covers only the waits this plugin does itself.
+                        # Inside sendText the library has its own: up to 30 seconds
+                        # for the link, and a close-sleep-reopen on a socket error
+                        # with no limit of its own. Hermes stops watching at 15
+                        # seconds and would keep the approval armed, so this returns
+                        # a decline now and lets the thread finish on its own.
+                        self._hold_slot_until(pending)
+                        return SendResult(
+                            success=False,
+                            error=(
+                                "The approval question was not sent within 12 seconds. The radio library is "
+                                "still inside its own send, so this line may still go out afterwards. The "
+                                "approval is dropped either way, so /approve will not run the command."
+                            ),
+                            retryable=False,
+                            raw_response={"code": "egress_declined"},
+                        )
                 else:
                     packet_id = await asyncio.to_thread(send_text, iface, dest, chunk)
             except RadioNotSent:
@@ -741,11 +794,31 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def _send_exec_approval_prompt(self, prompt) -> SendResult:
         """Send one approval question as text, on Hermes' button path.
 
+        Every outcome, including a bug in this plugin, is reported as a send that
+        did not happen. An exception raised out of here instead makes Hermes send
+        the same question as plain text; this adapter refuses that text, Hermes
+        does not read the refusal, and the approval stays armed for /approve with
+        nothing on the radio.
+        """
+        try:
+            return await self._approval_prompt(prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _undelivered_approval(SendResult(
+                success=False,
+                retryable=False,
+                error="The approval question was not sent.",
+            ))
+
+    async def _approval_prompt(self, prompt) -> SendResult:
+        """Build and send the one radio line for an approval question.
+
         The radio line is the structured command and description. The long prompt
-        text is not parsed. A line break, a format character, a backtick fence,
-        a command that does not fit one chunk, a command that is not the one
-        /approve will run, or a Hermes build with no command field is not
-        transmitted. The gap and a full queue share one 12 second budget, so
+        text is not parsed. A line break, a format character, a surrogate, a
+        backtick fence, a command that does not fit one chunk, a command that is
+        not the one /approve will run, or a Hermes build with no command field is
+        not transmitted. The gap and a full queue share one 12 second budget, so
         the decline returns before Hermes stops watching at 15 seconds. A
         decline drops the pending approval, so /approve cannot run it.
         """
@@ -789,7 +862,27 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         A decline makes Hermes drop the pending confirmation and not send the
         long prompt, which names /always and is cut when the chunk is small.
+        Any error here is reported as a decline for the same reason.
         """
+        try:
+            return await self._slash_confirm(chat_id, title, message, metadata)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return SendResult(
+                success=False,
+                retryable=False,
+                error="The confirmation was not sent.",
+                raw_response={"code": "egress_declined"},
+            )
+
+    async def _slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        metadata: dict | None = None,
+    ) -> SendResult:
         text = slash_confirm_line(title, message)
         stamped = dict(metadata or {})
         stamped["radio_confirm"] = True

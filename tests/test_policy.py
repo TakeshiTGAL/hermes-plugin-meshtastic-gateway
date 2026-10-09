@@ -292,6 +292,28 @@ def test_approval_line_is_the_command_and_a_fence_is_refused():
     assert policy.radio_text_is_one_line("") is False
 
 
+def test_a_surrogate_or_unshowable_code_point_is_refused_not_raised():
+    """A lone surrogate has no UTF-8 form. Building the line must refuse, not raise."""
+    command = "rm -r /tmp/rb-sur-missing\udc80x"
+    assert unicodedata.category("\udc80") == "Cs"
+    assert policy.radio_text_is_one_line(command) is False
+    assert policy.radio_approval_line(command, "cleanup", 200) is None
+    assert policy.radio_approval_line("echo hi", "why\udc80", 200) is None
+    # Private use (Co) and unassigned (Cn) have no agreed glyph.
+    assert unicodedata.category("\ue000") == "Co"
+    assert unicodedata.category("\U000e0000") == "Cn"
+    assert policy.radio_text_is_one_line("echo \ue000") is False
+    assert policy.radio_text_is_one_line("echo \U000e0000") is False
+    assert policy.radio_approval_line("echo \ue000", "reason", 200) is None
+    assert policy.radio_approval_line("echo hi", "reason \U000e0000", 200) is None
+    assert policy.radio_text_is_one_line("echo \u3042 ok") is True
+    # A reply is chunked, not refused: the surrogate must not raise out of the send path.
+    chunks, cut = policy.chunk_text("reply \udc80 here", 200, 4)
+    assert cut is False
+    assert chunks == ["reply ? here"]
+    assert "\udc80" not in chunks[0]
+
+
 def test_plain_text_restart_phrases_are_read_as_restart():
     for text in ("restart gateway", "please restart hermes", "Restart the Hermes gateway!"):
         assert policy.plaintext_restart(text) is True, text

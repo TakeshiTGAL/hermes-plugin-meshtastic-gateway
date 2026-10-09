@@ -209,7 +209,14 @@ def chunk_text(text: str, size: int, limit: int) -> tuple[list[str], bool]:
     """UTF-8 chunks that each fit in `size` bytes. The bool is True when text was cut."""
     size = chunk_bytes(size)
     limit = max_chunks(limit)
-    raw = text or ""
+    raw = str(text or "")
+    try:
+        raw.encode("utf-8")
+    except UnicodeError:
+        # A lone surrogate has no UTF-8 form. Replacing it keeps a reply from
+        # raising out of the send path. An approval line that holds one is
+        # refused by radio_text_is_one_line before it reaches this function.
+        raw = raw.encode("utf-8", "replace").decode("utf-8")
     chunks: list[str] = []
     buf = ""
     used = 0
@@ -450,8 +457,9 @@ def session_reset_command(text: object) -> bool:
 
 
 APPROVAL_PREFIX = "Reply /approve or /deny (once only). "
-# Cc control, Cf format (includes U+202E), Zl/Zp line and paragraph separators (includes U+2028).
-_RADIO_BREAK_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+# Cc control, Cf format (includes U+202E), Zl/Zp line and paragraph separators
+# (includes U+2028), Cs surrogate, Co private use, Cn unassigned.
+_RADIO_BREAK_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
 
 def radio_text_is_one_line(text: object) -> bool:
@@ -459,13 +467,23 @@ def radio_text_is_one_line(text: object) -> bool:
 
     `splitlines` catches Unicode line breaks that are not `\\n` or `\\r`.
     A character in Cc, Cf, Zl, or Zp can still sit inside one split line
-    (a trailing break, or U+202E) and is refused too. A backtick fence is refused.
+    (a trailing break, or U+202E) and is refused too. A surrogate (Cs) has no
+    UTF-8 form, and a private-use (Co) or unassigned (Cn) code point has no
+    agreed glyph, so those are refused as well. A string that cannot be encoded
+    as UTF-8 at all is refused last, whatever its categories say. A backtick
+    fence is refused.
     """
     if not isinstance(text, str) or text == "":
         return False
     if "```" in text or len(text.splitlines()) != 1:
         return False
-    return all(unicodedata.category(ch) not in _RADIO_BREAK_CATEGORIES for ch in text)
+    if any(unicodedata.category(ch) in _RADIO_BREAK_CATEGORIES for ch in text):
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
 
 
 def radio_approval_line(command: object, description: object, chunk: int) -> str | None:
