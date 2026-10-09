@@ -1920,3 +1920,181 @@ def test_connect_again_on_the_same_adapter_keeps_the_hour_and_seen_ids(monkeypat
     fresh = platform_registry.create_adapter("radio-dm-gateway", _config())
     assert fresh._seen == []
     assert fresh._budget is None
+
+
+def test_a_radio_reset_is_confirmed_as_new(monkeypatch):
+    """Hermes resolves /reset to /new before the confirm title is chosen.
+
+    Passing the title "/reset" into slash_confirm_line is not this path.
+    hermes_cli/commands.py aliases ("reset",) onto the command named new,
+    and the gateway confirm uses that canonical name.
+    """
+    import itertools
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from hermes_cli.commands import resolve_command
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    assert resolve_command("reset").name == "new"
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+    iface = _Iface()
+    created._iface = iface
+    created._budget = _NoWaitBudget()
+    box = {}
+
+    async def handler(_event):
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            user_id="!aabbccdd",
+            chat_id="!aabbccdd",
+            user_name="node",
+            chat_type="dm",
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={Platform.LOCAL: PlatformConfig(enabled=True)}
+        )
+        runner.adapters = {Platform.LOCAL: created}
+        runner.hooks = SimpleNamespace(
+            emit=AsyncMock(),
+            emit_collect=AsyncMock(return_value=[]),
+            loaded_hooks=False,
+        )
+        runner._slash_confirm_counter = itertools.count(1)
+        runner._thread_metadata_for_source = lambda *_args, **_kwargs: None
+        runner._reply_anchor_for_event = lambda _event: None
+        runner._session_key_for_source = lambda _src: "agent:main:radio:!aabbccdd"
+        runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+        event = MessageEvent(text="/reset", source=source, message_id="m-reset")
+        _handled, _result, command, canonical = await runner._hm_resolve_command(
+            event, source, "radio-reset"
+        )
+        box["command"] = command
+        box["canonical"] = canonical
+        box["dispatch"] = await runner._hm_dispatch_canonical_command(
+            event, source, "radio-reset", canonical
+        )
+        return None
+
+    async def run():
+        created.set_message_handler(handler)
+        await created._accept({
+            "node": "!aabbccdd", "text": "go", "channel": False, "packet_id": "reset-1",
+        })
+        await _finish_turns(created)
+
+    asyncio.run(run())
+    assert box["command"] == "reset"
+    assert box["canonical"] == "new"
+    sent = [text for _dest, text, _ack in iface.sent]
+    assert sent == ["/new discards history. /approve or /cancel. always refused."]
+    from tools import slash_confirm
+    slash_confirm.clear("agent:main:radio:!aabbccdd")
+
+
+def test_a_late_library_send_declines_the_next_approval(monkeypatch):
+    """After a stuck sendText is declined, the next approval must not go out.
+
+    The late line can still reach the radio. Another approval waiting on the
+    send lock would otherwise sleep out the gap and stay armed, so /approve
+    in those seconds would run it. That next approval is declined once.
+    """
+    from gateway.platforms.base import ExecApprovalPrompt
+    from gateway.relay.egress import declined_send
+
+    monkeypatch.setattr(adapter, "remember", lambda *_args: None)
+    monkeypatch.setattr(adapter, "APPROVAL_SEND_SECONDS", 0.6)
+    monkeypatch.setattr(adapter, "APPROVAL_THREAD_GRACE_SECONDS", 0.15)
+    _register()
+    created = platform_registry.create_adapter("radio-dm-gateway", _config())
+
+    class _Gap:
+        """A wait the old path would sleep, still inside the approval budget."""
+
+        gap = 0.4
+
+        def plan(self, _count, _now):
+            return None, 0.4
+
+        def mark(self, _now):
+            return None
+
+    class _Stuck:
+        def __init__(self):
+            self.sent = []
+            self.inside = threading.Event()
+            self.release = threading.Event()
+
+        def sendText(self, text, destinationId, wantAck=False):
+            if not self.inside.is_set():
+                self.inside.set()
+                self.release.wait(30)
+            self.sent.append((destinationId, text, wantAck))
+            return {"id": len(self.sent)}
+
+    iface = _Stuck()
+    created._iface = iface
+    created._budget = _Gap()
+
+    def _prompt(session, command, reason):
+        return ExecApprovalPrompt(
+            chat_id="!aabbccdd",
+            session_key=session,
+            text=command,
+            actions=[("Allow Once", "once", "primary")],
+            command=command,
+            description=reason,
+            smart_denied=False,
+        )
+
+    box = {}
+
+    async def run():
+        # An approval may leave the turn task. A live turn is what allows that send.
+        created._send_tasks.add("turn")
+        created._turn_nodes["!aabbccdd"] = 1
+        _hold_pending("s-late-x", "echo X")
+        _hold_pending("s-late-y", "echo Y")
+        _hold_pending("s-late-z", "echo Z")
+        started = time.monotonic()
+        first = asyncio.ensure_future(
+            created._send_exec_approval_prompt(_prompt("s-late-x", "echo X", "first"))
+        )
+        for _ in range(50):
+            if iface.inside.is_set():
+                break
+            await asyncio.sleep(0.02)
+        # Time runs out while sendText is still blocked, and the slot stays held.
+        box["first"] = await first
+        box["first_elapsed"] = time.monotonic() - started
+        second = asyncio.ensure_future(
+            created._send_exec_approval_prompt(_prompt("s-late-y", "echo Y", "second"))
+        )
+        await asyncio.sleep(0.05)
+        released = time.monotonic()
+        iface.release.set()
+        box["second"] = await second
+        box["second_after_release"] = time.monotonic() - released
+        box["third"] = await created._send_exec_approval_prompt(
+            _prompt("s-late-z", "echo Z", "third")
+        )
+        _clear_pending("s-late-x")
+        _clear_pending("s-late-y")
+        _clear_pending("s-late-z")
+
+    asyncio.run(run())
+    assert box["first"].success is False and declined_send(box["first"]) is True
+    assert box["first_elapsed"] < 2
+    assert box["second"].success is False and declined_send(box["second"]) is True
+    assert box["second_after_release"] < 0.3
+    texts = [text for _dest, text, _ack in iface.sent]
+    assert any("echo X" in text for text in texts)
+    assert all("echo Y" not in text for text in texts)
+    assert box["third"].success is True
+    assert any("echo Z" in text for text in texts)

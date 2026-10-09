@@ -255,6 +255,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # A radio thread this adapter stopped waiting for. It still holds the send slot,
         # because asyncio cannot cancel a thread that is inside the library.
         self._orphan_send: asyncio.Future | None = None
+        # Set when an approval send is still inside the library after its time limit.
+        # The late line can reach the radio after Hermes has dropped that approval.
+        # The next approval is declined once, so /approve cannot run it in the gap
+        # before its own line would have gone out.
+        self._decline_next_approval = False
         # Set by the library's connection-lost event. A send then fails at once instead of
         # waiting up to 30 seconds inside the library for a link that is gone.
         self._radio_lost = False
@@ -683,6 +688,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
     async def _send_locked(
         self, dest: str, chunks: list[str], cut: bool, approval: bool, started: float
     ) -> SendResult:
+        if approval and self._decline_next_approval:
+            # The previous approval's library call has just released this slot.
+            # Declining here, before the gap wait, closes the window where
+            # /approve would run this command while only the late line is on the air.
+            self._decline_next_approval = False
+            return SendResult(
+                success=False,
+                error=(
+                    "The approval question was not sent. The previous approval stayed inside the radio "
+                    "library past its time limit and was declined, and that line may still have gone out. "
+                    "This next approval is declined once, so /approve will not run it."
+                ),
+                retryable=False,
+                raw_response={"code": "egress_declined"},
+            )
         if self._iface is None or not self._radio_up():
             return self._forget_failed_reply(
                 SendResult(success=False, error="The radio is not connected. Nothing was sent.", retryable=False)
@@ -742,6 +762,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         # with no limit of its own. Hermes stops watching at 15
                         # seconds and would keep the approval armed, so this returns
                         # a decline now and lets the thread finish on its own.
+                        # The next approval is declined once after that thread ends,
+                        # so /approve cannot run it before its own line goes out.
+                        self._decline_next_approval = True
                         self._hold_slot_until(pending)
                         return SendResult(
                             success=False,

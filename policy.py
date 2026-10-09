@@ -376,10 +376,14 @@ def _undo_count(message: object) -> int | None:
 def slash_confirm_line(title: object, message: object = "") -> str | None:
     """One radio line for a /new or /undo confirmation, or None when /undo has no single count.
 
-    /new and its alias /reset discard the conversation. /undo drops one exchange,
-    or the one count in the prompt. always is not offered.
+    /undo drops one exchange, or the one count in the prompt. always is not offered.
+    Hermes treats /reset as an alias of /new and passes the title /new, so a radio
+    /reset does not arrive here under the name /reset.
     """
     name = " ".join(str(title or "").split())
+    # Not the path a radio /reset takes. hermes_cli/commands.py lists aliases=("reset",)
+    # on the /new command, and the gateway confirm title is the canonical name /new.
+    # Kept so a title of /reset, if one were ever passed, still says history is discarded.
     if name in {"/new", "/reset"}:
         effect = "discards history"
     elif name == "/undo":
